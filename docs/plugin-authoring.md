@@ -199,6 +199,9 @@ are added or reordered. The official catalog requires this title for packages
 with several commands. A package with one command can use that command's name
 as its title. If the manifest declares `display_name`, set `[package].sofka` to
 `>=0.27.1` or a later supported version. Older manifest readers reject this field.
+Sofka rejects a missing requirement or a range that permits versions before
+0.27.1 when `display_name` is present. Valid ranges include `^0.27.1`,
+`>0.27.0`, and `>=0.27.1, <1`.
 
 A catalog install checks the package version and Sofka requirement against the
 selected release. It also checks each command's name, palette, key, arguments,
