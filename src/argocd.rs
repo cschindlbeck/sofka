@@ -756,12 +756,22 @@ fn source_detail(source: &Value) -> String {
 
 /// What is stopping this Application from being synced and healthy, most
 /// serious first, or a single line saying nothing is.
-fn sync_summary(
-    ev: &Evidence,
-    app: &DynamicObject,
-    sync: &str,
-    health: &str,
-) -> Vec<(Level, String)> {
+/// Whether the Application is unhealthy and nothing in its own status says why.
+///
+/// True is the case worth searching the cluster for: with
+/// `controller.resource.health.persist` off, which is the Argo CD default,
+/// `status.resources[].health` is never written and the health rolled up to the
+/// Application is all there is.
+pub fn health_unexplained(app: &DynamicObject, resources: &[ManagedResource]) -> bool {
+    matches!(health_status(app), "Degraded" | "Missing") && health_causes(app, resources).is_empty()
+}
+
+/// What the Application's own status says is wrong, most serious first. Empty
+/// when it says nothing.
+/// The causes that account for an Application being unhealthy. Drift is left
+/// out: an OutOfSync resource says the cluster differs from git, which is not a
+/// reason anything is Degraded, and treating it as one hides the real fault.
+fn health_causes(app: &DynamicObject, resources: &[ManagedResource]) -> Vec<(Level, String)> {
     let mut out = Vec::new();
 
     if auto_sync(app) == AutoSync::Suspended {
@@ -787,8 +797,7 @@ fn sync_summary(
         out.push((level, join(&kind, &message)));
     }
 
-    let broken: Vec<&ManagedResource> = ev
-        .resources
+    let broken: Vec<&ManagedResource> = resources
         .iter()
         .filter(|r| matches!(r.health.as_str(), "Degraded" | "Missing"))
         .collect();
@@ -805,11 +814,14 @@ fn sync_summary(
         ));
     }
 
-    let drifted: Vec<&ManagedResource> = ev
-        .resources
-        .iter()
-        .filter(|r| r.sync == "OutOfSync")
-        .collect();
+    out
+}
+
+/// Managed resources the cluster no longer matches.
+fn drift_causes(resources: &[ManagedResource]) -> Vec<(Level, String)> {
+    let mut out = Vec::new();
+    let drifted: Vec<&ManagedResource> =
+        resources.iter().filter(|r| r.sync == "OutOfSync").collect();
     for r in drifted.iter().take(5) {
         out.push((Level::Warn, format!("{}/{} is OutOfSync", r.kind, r.name)));
     }
@@ -819,9 +831,20 @@ fn sync_summary(
             format!("… and {} more OutOfSync", drifted.len() - 5),
         ));
     }
+    out
+}
+
+fn sync_summary(
+    ev: &Evidence,
+    app: &DynamicObject,
+    sync: &str,
+    health: &str,
+) -> Vec<(Level, String)> {
+    let mut out = health_causes(app, &ev.resources);
 
     // Argo can roll a health up from live cluster state it does not publish per
-    // resource, leaving nothing above to name.
+    // resource, leaving nothing above to name. Decided before drift is added,
+    // because an OutOfSync resource is not an answer to why anything is broken.
     if out.is_empty() && matches!(health, "Degraded" | "Missing" | "Progressing") {
         let level = if health == "Progressing" {
             Level::Warn
@@ -837,6 +860,8 @@ fn sync_summary(
             ),
         ));
     }
+
+    out.extend(drift_causes(&ev.resources));
 
     if out.is_empty() {
         let rev = revision(app);
@@ -948,6 +973,47 @@ mod tests {
 
     fn texts(findings: &[Finding]) -> Vec<String> {
         findings.iter().map(|f| f.text.clone()).collect()
+    }
+
+    /// Argo CD only fills in `status.resources[].health` when
+    /// `controller.resource.health.persist` is turned on, which it is not by
+    /// default, so an unhealthy Application usually says nothing about why.
+    #[test]
+    fn degraded_health_with_a_silent_resource_list_is_unexplained() {
+        let mut obj = healthy();
+        obj.data["status"]["health"]["status"] = json!("Degraded");
+        obj.data["status"]["resources"] = json!([
+            {"version": "v1", "kind": "Service", "namespace": "guestbook",
+             "name": "guestbook-ui", "status": "Synced"}
+        ]);
+        let resources = managed_resources(&obj);
+        assert!(health_unexplained(&obj, &resources));
+    }
+
+    #[test]
+    fn a_degraded_resource_or_a_condition_explains_the_health() {
+        let mut broken = healthy();
+        broken.data["status"]["health"]["status"] = json!("Degraded");
+        broken.data["status"]["resources"] = json!([
+            {"version": "v1", "kind": "Service", "namespace": "guestbook",
+             "name": "guestbook-ui", "status": "Synced", "health": {"status": "Degraded"}}
+        ]);
+        assert!(!health_unexplained(&broken, &managed_resources(&broken)));
+
+        let mut reported = healthy();
+        reported.data["status"]["health"]["status"] = json!("Degraded");
+        reported.data["status"]["conditions"] =
+            json!([{"type": "SyncError", "message": "repo not found"}]);
+        assert!(!health_unexplained(
+            &reported,
+            &managed_resources(&reported)
+        ));
+    }
+
+    #[test]
+    fn a_healthy_application_is_never_unexplained() {
+        let obj = healthy();
+        assert!(!health_unexplained(&obj, &managed_resources(&obj)));
     }
 
     #[test]

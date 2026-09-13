@@ -438,6 +438,18 @@ concurrent drains, and full kubectl drain parity are outside this feature.
   blocking - a suspended sync policy, a `ComparisonError`, a failed sync
   operation, degraded or missing objects, or drift. Each managed resource is a finding you can `⏎` into. Read entirely from
   the Application CRD: no Argo CD API server, no token, no `argocd` binary.
+  When health is `Degraded` or `Missing` and nothing in the Application's own
+  status accounts for it, sofka looks for the cause in the objects themselves
+  and lists what it finds under the blocking line, each row a finding you can
+  `⏎` into. Drift does not count as an account of it: an OutOfSync resource says
+  the cluster differs from git, which is a separate fault from something being
+  broken. This is the usual case rather than an edge one: Argo CD fills in
+  `status.resources[].health` only when `controller.resource.health.persist` is
+  turned on, and it is off by default, so a degraded Application normally names
+  no culprit. The search reads at most five causes, and only when the
+  Application is unexplained, its destination is the cluster you are connected
+  to, and it manages something that can own other objects - a Deployment or a
+  CronJob, never a ConfigMap.
   Applications deploying to a **remote cluster** are handled honestly - the
   destination is resolved against your kubeconfig and shown by context name, and
   because those objects do not live in the cluster you are connected to, `⏎`

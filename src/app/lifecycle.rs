@@ -1367,6 +1367,24 @@ impl App {
                 self.argocd_state
                     .select((!self.argocd_items.is_empty()).then_some(first));
                 self.clear_claimed_status(claim);
+                // Nothing in the Application's own status says why it is
+                // unhealthy, so go and look. Costs nothing for the rest.
+                if self
+                    .argocd_source
+                    .as_ref()
+                    .is_some_and(|a| crate::argocd::health_unexplained(a, &self.argocd_resources))
+                {
+                    self.spawn_argocd_cause();
+                }
+            }
+            Msg::ArgocdCause {
+                generation,
+                request,
+                claim,
+                findings,
+            } if generation == self.generation && request == self.argocd_request => {
+                self.apply_argocd_cause(findings);
+                self.clear_claimed_status(claim);
             }
             Msg::ArgocdChildren {
                 generation,

@@ -22876,6 +22876,382 @@ async fn argocd_expansion_reads_the_parent_in_its_own_api_group() {
     );
 }
 
+async fn receive_argocd_cause(app: &mut App, rx: &mut Receiver<Msg>) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(message) = rx.recv().await {
+            if matches!(message, Msg::ArgocdCause { .. }) {
+                app.handle_msg(message);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("argocd cause did not arrive");
+}
+
+/// With Argo CD's default settings `status.resources[]` carries no health, so an
+/// unhealthy Application says nothing about why. The cause is then only in the
+/// objects themselves.
+#[tokio::test]
+async fn argocd_view_finds_the_cause_of_an_unexplained_degraded_application() {
+    let mut root = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                             "namespace": "default"}));
+    root["status"]["sync"]["status"] = json!("Synced");
+    root["status"]["health"] = json!({"status": "Degraded"});
+    root["status"]["resources"] = json!([
+        {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "default",
+         "name": "web", "status": "Synced"}
+    ]);
+    let (mut app, mut rx, responses, _) = health_report_app("applications", root.clone());
+    app.cluster
+        .register_kind("apps", "ReplicaSet", "replicasets", true);
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/applications/web",
+        kind.ar.api_version
+    );
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(path, (200, root));
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/deployments/web".into(),
+            (
+                200,
+                json!({"apiVersion": "apps/v1", "kind": "Deployment",
+                       "metadata": {"name": "web", "namespace": "default", "uid": "dep"}}),
+            ),
+        );
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/replicasets".into(),
+            (
+                200,
+                json!({"apiVersion": "apps/v1", "kind": "ReplicaSetList", "metadata": {},
+                       "items": [{"metadata": {"name": "web-1", "namespace": "default",
+                                               "uid": "rs", "ownerReferences": [
+                                                 {"apiVersion": "apps/v1", "kind": "Deployment",
+                                                  "name": "web", "uid": "dep"}]},
+                                  "spec": {"replicas": 1},
+                                  "status": {"replicas": 1}}]}),
+            ),
+        );
+        replies.insert(
+            "/api/v1/namespaces/default/pods".into(),
+            (
+                200,
+                json!({"apiVersion": "v1", "kind": "PodList", "metadata": {},
+                       "items": [{"metadata": {"name": "web-1-abc", "namespace": "default",
+                                               "uid": "pod", "ownerReferences": [
+                                                 {"apiVersion": "apps/v1", "kind": "ReplicaSet",
+                                                  "name": "web-1", "uid": "rs"}]},
+                                  "status": {"phase": "Running", "containerStatuses": [
+                                      {"state": {"waiting": {"reason": "CrashLoopBackOff"}}}]}}]}),
+            ),
+        );
+    }
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+    let before: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(
+        before
+            .iter()
+            .any(|t| t.contains("but no managed resource reports it")),
+        "{before:?}"
+    );
+
+    receive_argocd_cause(&mut app, &mut rx).await;
+
+    let after: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    let dead_end = after
+        .iter()
+        .position(|t| t.contains("but no managed resource reports it"))
+        .expect("the line it explains");
+    assert_eq!(
+        after[dead_end + 1],
+        "Pod/web-1-abc: CrashLoopBackOff",
+        "the cause should sit under the line that said none was known: {after:?}"
+    );
+}
+
+/// The Application's own status already names a cause, so there is nothing to
+/// go looking for and no reads to pay for.
+#[tokio::test]
+async fn argocd_view_does_not_search_when_the_status_explains_itself() {
+    let mut root = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                             "namespace": "default"}));
+    root["status"]["health"] = json!({"status": "Degraded"});
+    root["status"]["conditions"] = json!([{"type": "ComparisonError", "message": "boom"}]);
+    root["status"]["resources"] = json!([
+        {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "default",
+         "name": "web", "status": "Synced"}
+    ]);
+    let (mut app, mut rx, responses, _) = health_report_app("applications", root.clone());
+    app.cluster
+        .register_kind("apps", "ReplicaSet", "replicasets", true);
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/applications/web",
+        kind.ar.api_version
+    );
+    responses.lock().unwrap().insert(path, (200, root));
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+
+    assert!(
+        !app.flash.contains("looking for the cause"),
+        "searched anyway: {}",
+        app.flash
+    );
+}
+
+/// One Application can deploy across namespaces. Fetching every parent from the
+/// first one finds nothing, or finds a same-named object belonging to someone
+/// else.
+#[tokio::test]
+async fn argocd_cause_search_uses_each_resources_own_namespace() {
+    let mut root = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                             "namespace": "default"}));
+    root["status"]["health"] = json!({"status": "Degraded"});
+    root["status"]["resources"] = json!([
+        {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "default",
+         "name": "front", "status": "Synced"},
+        {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "backend",
+         "name": "worker", "status": "Synced"}
+    ]);
+    let (mut app, mut rx, responses, _) = health_report_app("applications", root.clone());
+    app.cluster
+        .register_kind("apps", "ReplicaSet", "replicasets", true);
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/applications/web",
+        kind.ar.api_version
+    );
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(path, (200, root));
+        for (ns, name, uid) in [("default", "front", "d1"), ("backend", "worker", "d2")] {
+            replies.insert(
+                format!("/apis/apps/v1/namespaces/{ns}/deployments/{name}"),
+                (
+                    200,
+                    json!({"apiVersion": "apps/v1", "kind": "Deployment",
+                           "metadata": {"name": name, "namespace": ns, "uid": uid}}),
+                ),
+            );
+            replies.insert(
+                format!("/apis/apps/v1/namespaces/{ns}/replicasets"),
+                (
+                    200,
+                    json!({"apiVersion": "apps/v1", "kind": "ReplicaSetList", "metadata": {},
+                           "items": [{"metadata": {"name": format!("{name}-1"), "namespace": ns,
+                                                   "uid": format!("rs-{uid}"),
+                                                   "ownerReferences": [
+                                                     {"apiVersion": "apps/v1", "kind": "Deployment",
+                                                      "name": name, "uid": uid}]},
+                                      "spec": {"replicas": 1}, "status": {"replicas": 1}}]}),
+                ),
+            );
+        }
+        // Only the second namespace holds the broken pod.
+        replies.insert(
+            "/api/v1/namespaces/default/pods".into(),
+            (
+                200,
+                json!({"apiVersion": "v1", "kind": "PodList", "metadata": {}, "items": []}),
+            ),
+        );
+        replies.insert(
+            "/api/v1/namespaces/backend/pods".into(),
+            (
+                200,
+                json!({"apiVersion": "v1", "kind": "PodList", "metadata": {},
+                       "items": [{"metadata": {"name": "worker-1-xyz", "namespace": "backend",
+                                               "uid": "pod", "ownerReferences": [
+                                                 {"apiVersion": "apps/v1", "kind": "ReplicaSet",
+                                                  "name": "worker-1", "uid": "rs-d2"}]},
+                                  "status": {"phase": "Running", "containerStatuses": [
+                                      {"state": {"waiting": {"reason": "ErrImagePull"}}}]}}]}),
+            ),
+        );
+    }
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+    receive_argocd_cause(&mut app, &mut rx).await;
+
+    let texts: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(
+        texts.contains(&"Pod/worker-1-xyz: ErrImagePull"),
+        "the cause in the second namespace is missing: {texts:?}"
+    );
+}
+
+/// Drift and degradation are different faults. An Application that is both
+/// OutOfSync and Degraded still has nothing saying why it is Degraded.
+#[tokio::test]
+async fn argocd_view_searches_for_a_cause_despite_unrelated_drift() {
+    let mut root = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                             "namespace": "default"}));
+    root["status"]["health"] = json!({"status": "Degraded"});
+    root["status"]["resources"] = json!([
+        {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "default",
+         "name": "web", "status": "Synced"},
+        {"version": "v1", "kind": "ConfigMap", "namespace": "default", "name": "settings",
+         "status": "OutOfSync"}
+    ]);
+    let (mut app, mut rx, responses, _) = health_report_app("applications", root.clone());
+    app.cluster
+        .register_kind("apps", "ReplicaSet", "replicasets", true);
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/applications/web",
+        kind.ar.api_version
+    );
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(path, (200, root));
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/deployments/web".into(),
+            (
+                200,
+                json!({"apiVersion": "apps/v1", "kind": "Deployment",
+                       "metadata": {"name": "web", "namespace": "default", "uid": "dep"}}),
+            ),
+        );
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/replicasets".into(),
+            (
+                200,
+                json!({"apiVersion": "apps/v1", "kind": "ReplicaSetList", "metadata": {},
+                       "items": [{"metadata": {"name": "web-1", "namespace": "default",
+                                               "uid": "rs", "ownerReferences": [
+                                                 {"apiVersion": "apps/v1", "kind": "Deployment",
+                                                  "name": "web", "uid": "dep"}]},
+                                  "spec": {"replicas": 1}, "status": {"replicas": 1}}]}),
+            ),
+        );
+        replies.insert(
+            "/api/v1/namespaces/default/pods".into(),
+            (
+                200,
+                json!({"apiVersion": "v1", "kind": "PodList", "metadata": {},
+                       "items": [{"metadata": {"name": "web-1-abc", "namespace": "default",
+                                               "uid": "pod", "ownerReferences": [
+                                                 {"apiVersion": "apps/v1", "kind": "ReplicaSet",
+                                                  "name": "web-1", "uid": "rs"}]},
+                                  "status": {"phase": "Running", "containerStatuses": [
+                                      {"state": {"waiting": {"reason": "CrashLoopBackOff"}}}]}}]}),
+            ),
+        );
+    }
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+    receive_argocd_cause(&mut app, &mut rx).await;
+
+    let texts: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(
+        texts.contains(&"Pod/web-1-abc: CrashLoopBackOff"),
+        "drift hid the real cause: {texts:?}"
+    );
+}
+
+/// Leaving the view while the search is still running must hand the status line
+/// back, or it reads "looking for the cause…" for the rest of the session.
+#[tokio::test]
+async fn leaving_the_argocd_view_clears_the_cause_status() {
+    let mut root = argocd_application(json!({"server": "https://kubernetes.default.svc",
+                                             "namespace": "default"}));
+    root["status"]["health"] = json!({"status": "Degraded"});
+    root["status"]["resources"] = json!([
+        {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "default",
+         "name": "web", "status": "Synced"}
+    ]);
+    let (mut app, mut rx, responses, _) = health_report_app("applications", root.clone());
+    app.cluster
+        .register_kind("apps", "ReplicaSet", "replicasets", true);
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/applications/web",
+        kind.ar.api_version
+    );
+    {
+        let mut replies = responses.lock().unwrap();
+        replies.insert(path, (200, root));
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/deployments/web".into(),
+            (
+                200,
+                json!({"apiVersion": "apps/v1", "kind": "Deployment",
+                       "metadata": {"name": "web", "namespace": "default", "uid": "dep"}}),
+            ),
+        );
+        replies.insert(
+            "/apis/apps/v1/namespaces/default/replicasets".into(),
+            (
+                200,
+                json!({"apiVersion": "apps/v1", "kind": "ReplicaSetList", "metadata": {},
+                       "items": []}),
+            ),
+        );
+    }
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+    assert!(
+        app.flash.contains("looking for the cause"),
+        "the search never claimed the status: {}",
+        app.flash
+    );
+
+    app.handle_key(press(KeyCode::Esc)).unwrap();
+
+    assert!(
+        !app.flash.contains("looking for the cause"),
+        "the status is still owned by a search nobody will answer: {}",
+        app.flash
+    );
+}
+
+/// Reading objects in the connected cluster to explain an Application that
+/// deploys somewhere else would describe the wrong objects.
+#[tokio::test]
+async fn argocd_view_does_not_search_for_a_cause_in_another_cluster() {
+    let mut root = argocd_application(json!({"server": "https://other.example",
+                                             "namespace": "default"}));
+    root["status"]["health"] = json!({"status": "Degraded"});
+    root["status"]["resources"] = json!([
+        {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "default",
+         "name": "web", "status": "Synced"}
+    ]);
+    let (mut app, mut rx, responses, _) = health_report_app("applications", root.clone());
+    app.cluster
+        .register_kind("apps", "ReplicaSet", "replicasets", true);
+    let kind = app.kind.as_ref().unwrap();
+    let path = format!(
+        "/apis/{}/namespaces/default/applications/web",
+        kind.ar.api_version
+    );
+    responses.lock().unwrap().insert(path, (200, root));
+
+    open_argocd_view(&mut app);
+    receive_argocd_report(&mut app, &mut rx).await;
+
+    let texts: Vec<&str> = app.argocd_items.iter().map(|f| f.text.as_str()).collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("but no managed resource reports it")),
+        "{texts:?}"
+    );
+    assert!(
+        !app.flash.contains("looking for the cause"),
+        "read the wrong cluster: {}",
+        app.flash
+    );
+}
+
 /// `c` on a managed resource walks `ownerReferences` down from it, indenting
 /// Deployment → ReplicaSet → Pod under the row, and `c` again collapses.
 #[tokio::test]
