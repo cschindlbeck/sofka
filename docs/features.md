@@ -402,7 +402,12 @@ concurrent drains, and full kubectl drain parity are outside this feature.
 - **Flux CD controls** (`t`) - a suspend/resume/reconcile-now menu built on
   native Kubernetes API patches, for Kustomizations, HelmReleases, git/helm/oci
   repositories, buckets, image automation, and notification alerts and
-  receivers. No `flux` binary needed. Works with bulk multiselect. `⏎` on a
+  receivers. No `flux` binary needed. Works with bulk multiselect. For
+  HelmRelease resources, **Force reconcile** requests a Helm install or upgrade
+  even when the specification has not changed. It sets
+  `reconcile.fluxcd.io/requestedAt` and `reconcile.fluxcd.io/forceAt` to the same
+  new timestamp. The status message confirms the request was sent; it does not
+  wait for the Helm operation to finish. `⏎` on a
   **HelmRelease** opens the revision history of the Helm release it manages
   (resolved the way helm-controller composes `releaseName`/`storageNamespace`):
   `⏎` shows a revision's values, `y` the rendered manifest, `d` the NOTES, `r`

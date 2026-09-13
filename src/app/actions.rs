@@ -1839,9 +1839,9 @@ impl App {
                             self.do_flux_suspend(targets, false);
                         }
                     }
-                    Some("Reconcile now") => {
+                    Some("Reconcile now" | "Force reconcile") => {
                         let targets = self.action_targets();
-                        self.do_flux_reconcile(targets);
+                        self.do_flux_reconcile(targets, choice == Some("Force reconcile"));
                     }
                     Some("Sync now") => {
                         let targets = self.action_targets();
@@ -1892,10 +1892,8 @@ impl App {
         );
     }
 
-    /// Force an immediate Flux reconciliation, bypassing the normal interval —
-    /// patches `reconcile.fluxcd.io/requestedAt`, the same annotation `flux
-    /// reconcile` sets, watched by every toolkit controller.
-    pub(super) fn do_flux_reconcile(&mut self, targets: Vec<(String, String)>) {
+    /// Request Flux reconciliation. Force also requests a Helm install or upgrade.
+    pub(super) fn do_flux_reconcile(&mut self, targets: Vec<(String, String)>, force: bool) {
         let Some(kind) = self.kind.clone() else {
             return;
         };
@@ -1903,34 +1901,38 @@ impl App {
             return; // see `do_flux_suspend`
         }
         let now = k8s_openapi::jiff::Timestamp::now().to_string();
-        let label = self.action_label(&targets);
-        self.note_action("reconcile", label);
-        let progress = if targets.len() == 1 {
-            format!("reconciling {}…", targets[0].0)
+        let action = if force {
+            "force reconcile"
         } else {
-            format!("reconciling {} {}…", targets.len(), self.kind_plural)
+            "reconcile"
+        };
+        let verb = if force {
+            "force reconciling"
+        } else {
+            "reconciling"
+        };
+        let label = self.action_label(&targets);
+        self.note_action(action, label);
+        let progress = if targets.len() == 1 {
+            format!("{verb} {}…", targets[0].0)
+        } else {
+            format!("{verb} {} {}…", targets.len(), self.kind_plural)
         };
         let claim = self.claim_status(progress);
         self.marked.clear();
-        // Same overclaim as "drained": `reconcile_patch` only stamps
-        // `reconcile.fluxcd.io/requestedAt`, and the Flux controller acts on it
-        // later — unlike `flux reconcile`, which waits for the result.
+        // The controller processes the annotations after the patch succeeds.
         let ok_message = if targets.len() == 1 {
-            format!("reconcile requested: {}", targets[0].0)
+            format!("{action} requested: {}", targets[0].0)
         } else {
-            format!(
-                "reconcile requested: {} {}",
-                targets.len(),
-                self.kind_plural
-            )
+            format!("{action} requested: {} {}", targets.len(), self.kind_plural)
         };
         self.spawn_patch_action(
             kind,
             targets,
-            Patch::Merge(reconcile_patch(&now)),
+            Patch::Merge(reconcile_patch(&now, force)),
             claim,
             ok_message,
-            |name, e| format!("reconcile {name} failed: {e}"),
+            move |name, e| format!("{action} {name} failed: {e}"),
         );
     }
 
