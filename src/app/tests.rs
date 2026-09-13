@@ -5,6 +5,7 @@ use serde_json::json;
 use std::time::Instant;
 use tokio::sync::mpsc::{self, Receiver};
 
+mod flux;
 mod label_filter;
 mod proxy;
 mod scale;
@@ -5806,7 +5807,7 @@ async fn action_progress_flashes_keep_the_ellipsis_convention() {
     app.do_flux_suspend(targets.clone(), true);
     assert!(app.flash.ends_with('…'), "suspend: {}", app.flash);
 
-    app.do_flux_reconcile(targets.clone());
+    app.do_flux_reconcile(targets.clone(), false);
     assert!(app.flash.ends_with('…'), "reconcile: {}", app.flash);
 
     app.do_refresh_es(targets);
@@ -5844,7 +5845,7 @@ async fn an_action_with_no_targets_claims_nothing() {
     // updates — the selected row can be gone by the time Enter lands.
     app.do_flux_suspend(Vec::new(), true);
     assert!(app.flash.is_empty(), "{}", app.flash);
-    app.do_flux_reconcile(Vec::new());
+    app.do_flux_reconcile(Vec::new(), false);
     assert!(app.flash.is_empty(), "{}", app.flash);
 }
 
@@ -7467,7 +7468,7 @@ fn mutating_action_patch_payloads_are_stable() {
     assert_eq!(scale_patch(3), json!({ "spec": { "replicas": 3 } }));
     assert_eq!(suspend_patch(true), json!({ "spec": { "suspend": true } }));
     assert_eq!(
-        reconcile_patch("2026-07-04T12:00:00Z"),
+        reconcile_patch("2026-07-04T12:00:00Z", false),
         json!({
             "metadata": { "annotations": {
                 "reconcile.fluxcd.io/requestedAt": "2026-07-04T12:00:00Z"

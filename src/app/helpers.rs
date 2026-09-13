@@ -27,10 +27,14 @@ pub(super) fn suspend_patch(suspend: bool) -> Value {
     json!({ "spec": { "suspend": suspend } })
 }
 
-pub(super) fn reconcile_patch(requested_at: &str) -> Value {
-    json!({
+pub(super) fn reconcile_patch(requested_at: &str, force: bool) -> Value {
+    let mut patch = json!({
         "metadata": { "annotations": { "reconcile.fluxcd.io/requestedAt": requested_at } }
-    })
+    });
+    if force {
+        patch["metadata"]["annotations"]["reconcile.fluxcd.io/forceAt"] = requested_at.into();
+    }
+    patch
 }
 
 /// Annotation key for stashing an Application's `automated` block on suspend.
@@ -444,6 +448,13 @@ impl App {
             ARGOCD_MENU_ITEMS
         } else if self.argocd_kind() {
             ARGOCD_APPSET_MENU_ITEMS
+        } else if self.kind_plural == "helmreleases"
+            && self
+                .kind
+                .as_ref()
+                .is_some_and(|kind| kind.ar.group == "helm.toolkit.fluxcd.io")
+        {
+            HELMRELEASE_MENU_ITEMS
         } else {
             FLUX_MENU_ITEMS
         }

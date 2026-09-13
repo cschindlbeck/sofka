@@ -120,6 +120,14 @@ const ARGOCD_GROUP: &str = "argoproj.io";
 /// `flux reconcile` CLI uses, shared by every controller in the toolkit.
 pub const FLUX_MENU_ITEMS: &[&str] = &["Suspend", "Resume", "Reconcile now", "Cancel"];
 
+pub const HELMRELEASE_MENU_ITEMS: &[&str] = &[
+    "Suspend",
+    "Resume",
+    "Reconcile now",
+    "Force reconcile",
+    "Cancel",
+];
+
 /// Items in the CronJob action menu (`t`), in display order. "Trigger now"
 /// creates a Job from the CronJob's jobTemplate the same way `kubectl create
 /// job --from=cronjob/…` does; Suspend/Resume patch `spec.suspend` exactly

@@ -2598,6 +2598,8 @@ fn build_help(app: &App, width: usize) -> (Vec<Line<'static>>, String) {
             }
         } else if scope == "table" && action == Action::Logs {
             "logs (marked pods, or current row)"
+        } else if scope == "table" && action == Action::ActionMenu {
+            "action menu (HelmRelease: reconcile or force reconcile; pods: file transfer)"
         } else if scope == "port_forward_picker" && action == Action::Edit {
             "edit local port of the selected mapping"
         } else if action == Action::LogMarker {
