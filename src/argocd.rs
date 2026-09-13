@@ -249,12 +249,60 @@ pub fn project(app: &DynamicObject) -> &str {
     str_at(&app.data, "/spec/project")
 }
 
-/// The git/helm repository, from a single `spec.source` or the first of
-/// `spec.sources` on a multi-source Application.
-pub fn repo_url(app: &DynamicObject) -> &str {
-    match str_at(&app.data, "/spec/source/repoURL") {
-        "" => str_at(&app.data, "/spec/sources/0/repoURL"),
-        url => url,
+/// One source an Application deploys from, with the revision deployed from it.
+pub struct Source {
+    pub repo_url: String,
+    /// `path`, `chart`, `ref` and `targetRevision`, whichever the source sets.
+    pub detail: String,
+    pub revision: String,
+}
+
+/// Every source, in `spec.sources` order.
+///
+/// A multi-source Application pairs `spec.sources[i]` with
+/// `status.sync.revisions[i]`, so a chart and the repository holding its values
+/// each show where they came from instead of only the first one appearing.
+pub fn sources(app: &DynamicObject) -> Vec<Source> {
+    let d = &app.data;
+    let url = |v: &Value| {
+        v.get("repoURL")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let listed = d
+        .pointer("/spec/sources")
+        .and_then(Value::as_array)
+        .filter(|list| !list.is_empty());
+    if let Some(list) = listed {
+        // Mid-operation the revisions can exist only in the sync result, which
+        // is the same fallback `revision` makes. Without it the first source
+        // would show one and the rest none.
+        let revisions = d
+            .pointer("/status/sync/revisions")
+            .or_else(|| d.pointer("/status/operationState/syncResult/revisions"))
+            .and_then(Value::as_array);
+        return list
+            .iter()
+            .enumerate()
+            .map(|(i, source)| Source {
+                repo_url: url(source),
+                detail: source_detail(source),
+                revision: revisions
+                    .and_then(|r| r.get(i))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+            .collect();
+    }
+    match d.pointer("/spec/source") {
+        Some(source) => vec![Source {
+            repo_url: url(source),
+            detail: source_detail(source),
+            revision: revision(app).to_string(),
+        }],
+        None => Vec::new(),
     }
 }
 
@@ -583,8 +631,12 @@ pub fn describe(ev: &Evidence) -> Vec<Finding> {
         auto_level,
         format!("auto-sync: {}", auto.detail()),
     ));
+    let sources = sources(app);
+    // Shown per source when they each carry one, so it would only be repeated
+    // here. Without them this is the only place a revision appears at all.
+    let per_source_revisions = sources.len() > 1 && sources.iter().any(|s| !s.revision.is_empty());
     let rev = revision(app);
-    if !rev.is_empty() {
+    if !per_source_revisions && !rev.is_empty() {
         out.push(finding(
             1,
             Level::Info,
@@ -594,14 +646,23 @@ pub fn describe(ev: &Evidence) -> Vec<Finding> {
 
     // Source block.
     out.push(finding(0, Level::Heading, "Source"));
-    let repo = repo_url(app);
-    if repo.is_empty() {
+    if sources.is_empty() {
         out.push(finding(1, Level::Info, "no source in spec"));
-    } else {
-        out.push(finding(1, Level::Info, short(repo)));
     }
-    if let Some(line) = source_detail(app) {
-        out.push(finding(2, Level::Info, line));
+    for source in &sources {
+        out.push(finding(1, Level::Info, short(&source.repo_url)));
+        let mut detail = source.detail.clone();
+        // With one source the revision is already on the Application block. With
+        // several there is no single deployed revision, so each carries its own.
+        if sources.len() > 1 && !source.revision.is_empty() {
+            if !detail.is_empty() {
+                detail.push_str(" · ");
+            }
+            detail.push_str(&format!("revision {}", short_revision(&source.revision)));
+        }
+        if !detail.is_empty() {
+            out.push(finding(2, Level::Info, detail));
+        }
     }
 
     // Managed resources.
@@ -674,24 +735,23 @@ fn headline_level(sync: &str, health: &str) -> Level {
 }
 
 /// `path` / `chart` plus `targetRevision`, whichever the source declares.
-fn source_detail(app: &DynamicObject) -> Option<String> {
-    let d = &app.data;
-    let at = |field: &str| match str_at(d, &format!("/spec/source/{field}")) {
-        "" => str_at(d, &format!("/spec/sources/0/{field}")).to_string(),
-        v => v.to_string(),
-    };
+fn source_detail(source: &Value) -> String {
     let mut parts = Vec::new();
     for (label, field) in [
         ("path", "path"),
         ("chart", "chart"),
+        ("ref", "ref"),
         ("targetRevision", "targetRevision"),
     ] {
-        let value = at(field);
-        if !value.is_empty() {
+        let value = source
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty());
+        if let Some(value) = value {
             parts.push(format!("{label} {value}"));
         }
     }
-    (!parts.is_empty()).then(|| parts.join(" · "))
+    parts.join(" · ")
 }
 
 /// What is stopping this Application from being synced and healthy, most
@@ -1120,18 +1180,124 @@ mod tests {
     }
 
     #[test]
-    fn multi_source_applications_read_the_first_source() {
+    fn a_single_source_list_reads_like_a_single_source() {
         let mut obj = healthy();
         obj.data["spec"]["source"] = json!(null);
         obj.data["spec"]["sources"] = json!([
             {"repoURL": "https://example.com/repo", "path": "app", "targetRevision": "v1.2.3"}
         ]);
-        assert_eq!(repo_url(&obj), "https://example.com/repo");
+        assert_eq!(sources(&obj)[0].repo_url, "https://example.com/repo");
         let out = describe(&evidence(obj, Destination::Current));
+        let texts = texts(&out);
         assert!(
-            texts(&out)
+            texts
                 .iter()
                 .any(|t| t == "path app · targetRevision v1.2.3")
+        );
+        // One source, so the revision stays on the Application block.
+        assert!(texts.iter().any(|t| t.starts_with("revision ")));
+    }
+
+    /// Mid-sync Argo records the revisions only in the operation result, and
+    /// reading one field without the other shows the first source's revision
+    /// and none of the others'.
+    #[test]
+    fn sources_read_revisions_from_the_sync_result_too() {
+        let mut obj = healthy();
+        obj.data["spec"]["source"] = json!(null);
+        obj.data["spec"]["sources"] = json!([
+            {"repoURL": "harbor.example/charts", "chart": "web"},
+            {"repoURL": "https://git.example/gitops.git", "ref": "values"}
+        ]);
+        obj.data["status"]["sync"] = json!({"status": "Synced"});
+        obj.data["status"]["operationState"] = json!({
+            "phase": "Running",
+            "syncResult": {"revisions": ["1.2.0", "9f7a301596ed7c2e9fcb4f3067425432c30d014e"]}
+        });
+
+        let sources = sources(&obj);
+        assert_eq!(sources[0].revision, "1.2.0");
+        assert_eq!(
+            sources[1].revision, "9f7a301596ed7c2e9fcb4f3067425432c30d014e",
+            "the second source lost its revision"
+        );
+    }
+
+    /// Argo does not always publish per-source revisions. When it has not, the
+    /// Application-level one is the only revision there is, so dropping it
+    /// would leave none at all.
+    #[test]
+    fn multi_source_without_per_source_revisions_keeps_the_application_one() {
+        let mut obj = healthy();
+        obj.data["spec"]["source"] = json!(null);
+        obj.data["spec"]["sources"] = json!([
+            {"repoURL": "harbor.example/charts", "chart": "web"},
+            {"repoURL": "https://git.example/gitops.git", "ref": "values"}
+        ]);
+        obj.data["status"]["sync"] = json!({"status": "Synced", "revision": "abc1234"});
+
+        let texts = texts(&describe(&evidence(obj, Destination::Current)));
+        assert!(
+            texts.iter().any(|t| t == "revision abc1234"),
+            "the only revision went missing: {texts:?}"
+        );
+    }
+
+    /// An empty `sources` list is not a declaration that there are none.
+    #[test]
+    fn an_empty_source_list_falls_back_to_the_single_source() {
+        let mut obj = healthy();
+        obj.data["spec"]["sources"] = json!([]);
+        let sources = sources(&obj);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            sources[0].repo_url,
+            "https://github.com/argoproj/argocd-example-apps"
+        );
+    }
+
+    /// A chart plus the repository holding its values is the common shape, and
+    /// showing only the first hides where the values came from.
+    #[test]
+    fn every_source_is_shown_with_the_revision_deployed_from_it() {
+        let mut obj = healthy();
+        obj.data["spec"]["source"] = json!(null);
+        obj.data["spec"]["sources"] = json!([
+            {"repoURL": "harbor.example/charts", "chart": "web", "targetRevision": "1.2.0"},
+            {"repoURL": "https://git.example/gitops.git", "ref": "values",
+             "targetRevision": "master"}
+        ]);
+        obj.data["status"]["sync"] = json!({
+            "status": "Synced",
+            "revisions": ["1.2.0", "9f7a301596ed7c2e9fcb4f3067425432c30d014e"]
+        });
+
+        let out = describe(&evidence(obj, Destination::Current));
+        let texts = texts(&out);
+        assert!(
+            texts.iter().any(|t| t == "harbor.example/charts"),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "https://git.example/gitops.git"),
+            "the second source is missing: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == "chart web · targetRevision 1.2.0 · revision 1.2.0"),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == "ref values · targetRevision master · revision 9f7a301"),
+            "{texts:?}"
+        );
+        // No single deployed revision to put on the Application block.
+        assert!(
+            !texts.iter().any(|t| t.starts_with("revision ")),
+            "{texts:?}"
         );
     }
 

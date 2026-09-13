@@ -432,11 +432,11 @@ concurrent drains, and full kubectl drain parity are outside this feature.
   message. Navigation to a target resource or a palette destination also
   cancels pending results.
 - **Argo CD view** (`:argocd` / `:argo`) - the state of the selected Application:
-  sync and health, the project and destination, the source repository with the
-  revision actually deployed, every object in `status.resources[]` with its own
-  sync and health, and a summary of what is blocking - a suspended sync policy, a
-  `ComparisonError`, a failed sync operation, degraded or missing objects, or
-  drift. Each managed resource is a finding you can `⏎` into. Read entirely from
+  sync and health, the project and destination, every source it deploys from with
+  the revision actually deployed from that source, every object in
+  `status.resources[]` with its own sync and health, and a summary of what is
+  blocking - a suspended sync policy, a `ComparisonError`, a failed sync
+  operation, degraded or missing objects, or drift. Each managed resource is a finding you can `⏎` into. Read entirely from
   the Application CRD: no Argo CD API server, no token, no `argocd` binary.
   Applications deploying to a **remote cluster** are handled honestly - the
   destination is resolved against your kubeconfig and shown by context name, and
