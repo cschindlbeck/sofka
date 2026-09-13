@@ -191,6 +191,11 @@ impl App {
         if let Some(claim) = self.argocd_claim.take() {
             self.clear_claimed_status(claim);
         }
+        // The cause search outlives the report it belongs to, and its result is
+        // dropped by the request guard, so nothing else would take the status back.
+        if let Some(claim) = self.argocd_cause_claim.take() {
+            self.clear_claimed_status(claim);
+        }
         self.cancel_argocd_children();
     }
 
@@ -411,6 +416,14 @@ type ChildPlan = HashMap<String, Vec<crate::k8s::Kind>>;
 /// Two levels covers Deployment to ReplicaSet to Pod and CronJob to Job to Pod.
 /// Kubernetes workloads do not nest deeper.
 const MAX_DEPTH: u8 = 2;
+
+/// One object found by walking `ownerReferences` down from a managed resource.
+struct Descendant {
+    obj: DynamicObject,
+    kind: String,
+    plural: String,
+    depth: u8,
+}
 
 impl App {
     /// A managed-resource row's identity, stable across re-gathers.
@@ -637,7 +650,7 @@ async fn gather_children(
 
     let mut lists: HashMap<String, Vec<DynamicObject>> = HashMap::new();
     let mut warn = None;
-    let mut out = Vec::new();
+    let mut found = Vec::new();
     walk(
         client,
         namespace,
@@ -647,10 +660,14 @@ async fn gather_children(
         plan,
         &mut lists,
         &mut warn,
-        &mut out,
+        &mut found,
     )
     .await;
 
+    let mut out: Vec<Finding> = found
+        .iter()
+        .map(|d| child_finding(&d.obj, &d.kind, &d.plural, namespace, d.depth))
+        .collect();
     if let Some(w) = warn {
         out.insert(0, child_finding_text(2, Level::Warn, w));
     } else if out.is_empty() {
@@ -670,7 +687,7 @@ fn walk<'a>(
     plan: &'a ChildPlan,
     lists: &'a mut HashMap<String, Vec<DynamicObject>>,
     warn: &'a mut Option<String>,
-    out: &'a mut Vec<Finding>,
+    out: &'a mut Vec<Descendant>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
         if depth > MAX_DEPTH {
@@ -703,13 +720,12 @@ fn walk<'a>(
             for obj in owned {
                 let uid = obj.metadata.uid.clone().unwrap_or_default();
                 let at = out.len();
-                out.push(child_finding(
-                    &obj,
-                    &kind.ar.kind,
-                    &plural,
-                    namespace,
+                out.push(Descendant {
+                    kind: kind.ar.kind.clone(),
+                    plural: plural.clone(),
+                    obj,
                     depth,
-                ));
+                });
                 walk(
                     client,
                     namespace,
@@ -728,7 +744,7 @@ fn walk<'a>(
                 // ReplicaSets: a Job with no pods yet is still worth showing.
                 if out.len() == at + 1
                     && kind.ar.kind == "ReplicaSet"
-                    && argocd::scaled_to_zero(&obj)
+                    && argocd::scaled_to_zero(&out[at].obj)
                 {
                     out.remove(at);
                 }
@@ -778,4 +794,149 @@ fn child_finding_text(indent: u8, level: Level, text: impl Into<String>) -> Find
         text: text.into(),
         target: None,
     }
+}
+
+/// How many causes to name before stopping.
+const MAX_CAUSES: usize = 5;
+
+impl App {
+    /// Search the cluster for what is making an Application unhealthy when its
+    /// own status does not say.
+    ///
+    /// Only worth doing when [`argocd::health_unexplained`] holds, which with
+    /// Argo CD's default `controller.resource.health.persist` is every unhealthy
+    /// Application: `status.resources[]` carries no health at all, so the only
+    /// place the reason exists is the objects themselves.
+    pub(super) fn spawn_argocd_cause(&mut self) {
+        // Objects of another cluster are not here, and a plural resolved against
+        // this one would open something else of the same name.
+        if self.argocd_destination != Destination::Current {
+            return;
+        }
+        // Only resources that can own something, so a ConfigMap costs nothing.
+        // Each keeps its own namespace: one Application can span several, and a
+        // parent fetched from the wrong one is either missing or somebody else's.
+        let parents: Vec<(crate::k8s::Kind, String, String, ChildPlan)> = self
+            .argocd_resources
+            .iter()
+            .filter(|r| !r.namespace.is_empty())
+            .filter_map(|r| {
+                let kind = self.cluster.resolve_in_group(&r.kind, &r.group)?;
+                let plan = self.children_plan(&kind, &r.namespace);
+                let plural = kind.ar.plural.to_lowercase();
+                plan.get(&plural)
+                    .is_some_and(|kids| !kids.is_empty())
+                    .then(|| (kind, r.namespace.clone(), r.name.clone(), plan))
+            })
+            .collect();
+        if parents.is_empty() {
+            return;
+        }
+
+        let client = self.cluster.client.clone();
+        let tx = self.tx.clone();
+        let genr = self.generation;
+        let request = self.argocd_request;
+        let claim = self.claim_status("Argo CD: looking for the cause…".to_string());
+        self.argocd_cause_claim = Some(claim);
+        tokio::spawn(async move {
+            let mut findings = Vec::new();
+            for (kind, namespace, name, plan) in parents {
+                if findings.len() >= MAX_CAUSES {
+                    break;
+                }
+                let plural = kind.ar.plural.to_lowercase();
+                findings.extend(
+                    unhealthy_descendants(&client, kind, plural, &namespace, &name, &plan).await,
+                );
+            }
+            findings.truncate(MAX_CAUSES);
+            let _ = tx
+                .send(Msg::ArgocdCause {
+                    generation: genr,
+                    request,
+                    claim,
+                    findings,
+                })
+                .await;
+        });
+    }
+
+    /// Put the causes under the line that said none were known.
+    pub(super) fn apply_argocd_cause(&mut self, findings: Vec<Finding>) {
+        self.argocd_cause_claim = None;
+        if findings.is_empty() {
+            return;
+        }
+        let Some(at) = self
+            .argocd_items
+            .iter()
+            .position(|f| f.text.contains("but no managed resource reports it"))
+        else {
+            return;
+        };
+        for (offset, finding) in findings.into_iter().enumerate() {
+            self.argocd_items.insert(at + 1 + offset, finding);
+        }
+    }
+}
+
+/// Walk one managed resource and report only the descendants in a bad state.
+async fn unhealthy_descendants(
+    client: &Client,
+    parent: crate::k8s::Kind,
+    parent_plural: String,
+    namespace: &str,
+    name: &str,
+    plan: &ChildPlan,
+) -> Vec<Finding> {
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &parent.ar);
+    let Ok(root) = api.get(name).await else {
+        return Vec::new();
+    };
+    let Some(uid) = root.metadata.uid.clone() else {
+        return Vec::new();
+    };
+    let mut lists: HashMap<String, Vec<DynamicObject>> = HashMap::new();
+    let mut warn = None;
+    let mut found = Vec::new();
+    walk(
+        client,
+        namespace,
+        &parent_plural,
+        &uid,
+        1,
+        plan,
+        &mut lists,
+        &mut warn,
+        &mut found,
+    )
+    .await;
+
+    found
+        .iter()
+        .filter_map(|d| {
+            let state = argocd::descendant_state(&d.obj);
+            // Only states that mean something is wrong. A ReplicaSet's ready
+            // count is context, not a cause, and the pod under it says more.
+            // `ErrImagePull` is the reason a pod carries before the kubelet
+            // starts backing off, so matching only the BackOff form would miss
+            // the first minute of every broken image.
+            let bad = matches!(
+                state.as_ref(),
+                "Failed" | "Unknown" | "Pending" | "Evicted" | "OOMKilled"
+            ) || state.ends_with("BackOff")
+                || state.ends_with("Error")
+                || state.starts_with("Err");
+            bad.then(|| {
+                let name = d.obj.metadata.name.clone().unwrap_or_default();
+                child_finding_text(2, Level::Critical, format!("{}/{name}: {state}", d.kind))
+                    .with_target(Target {
+                        plural: d.plural.clone(),
+                        namespace: Some(namespace.to_string()),
+                        name,
+                    })
+            })
+        })
+        .collect()
 }

@@ -2201,6 +2201,8 @@ pub struct App {
     /// collapse or a re-gather.
     argocd_children_request: u64,
     argocd_children_claims: Vec<StatusClaim>,
+    /// Claim held while searching for what is making an Application unhealthy.
+    argocd_cause_claim: Option<StatusClaim>,
     /// Session-local per-object state-change history, fed by the table watch.
     pub timeline: crate::timeline::Timeline,
     /// Table geometry from the last frame, for mouse hit-testing. A RefCell
@@ -2499,6 +2501,7 @@ impl App {
             argocd_expanded: HashMap::new(),
             argocd_children_request: 0,
             argocd_children_claims: Vec::new(),
+            argocd_cause_claim: None,
             timeline: crate::timeline::Timeline::default(),
             table_hit: RefCell::new(None),
             notify_tasks: HashMap::new(),

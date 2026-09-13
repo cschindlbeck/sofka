@@ -162,6 +162,14 @@ pub enum Msg {
         /// group; a plural on its own is ambiguous across groups.
         resources: Vec<crate::argocd::ManagedResource>,
     },
+    /// What is making an Application unhealthy, found by walking its managed
+    /// resources when its own status does not say.
+    ArgocdCause {
+        generation: u64,
+        request: u64,
+        claim: StatusClaim,
+        findings: Vec<crate::explain::Finding>,
+    },
     /// Descendants of one managed resource in the Argo CD view, found by
     /// walking `ownerReferences` down from it. Inserted under the row that
     /// asked for them.
