@@ -160,6 +160,7 @@ struct Manifest {
 #[serde(deny_unknown_fields)]
 pub struct Package {
     pub version: String,
+    pub display_name: Option<String>,
     pub description: String,
     pub license: String,
     #[serde(default)]
@@ -189,6 +190,13 @@ pub struct PackageRequirement {
 }
 
 pub fn validate_package(package: &Package) -> Result<(), String> {
+    if package
+        .display_name
+        .as_ref()
+        .is_some_and(|name| name.trim().is_empty())
+    {
+        return Err("package display_name must not be empty".into());
+    }
     if semver::Version::parse(&package.version).is_err() {
         return Err(format!(
             "package version {:?} is not a semantic version",
@@ -205,12 +213,20 @@ pub fn validate_package(package: &Package) -> Result<(), String> {
     {
         return Err("package authors must not contain an empty entry".into());
     }
-    if let Some(sofka) = &package.sofka
-        && semver::VersionReq::parse(sofka).is_err()
+    let requirement = package
+        .sofka
+        .as_ref()
+        .map(|sofka| {
+            semver::VersionReq::parse(sofka)
+                .map_err(|_| format!("package sofka {sofka:?} is not a version requirement"))
+        })
+        .transpose()?;
+    if package.display_name.is_some()
+        && !requirement.as_ref().is_some_and(|requirement| {
+            requires_version(requirement, &semver::Version::new(0, 27, 1))
+        })
     {
-        return Err(format!(
-            "package sofka {sofka:?} is not a version requirement"
-        ));
+        return Err("package display_name requires a sofka requirement that excludes versions before 0.27.1".into());
     }
     for field in [&package.repository, &package.readme] {
         if field.as_ref().is_some_and(|value| value.trim().is_empty()) {
@@ -258,6 +274,45 @@ pub fn validate_package(package: &Package) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn requires_version(requirement: &semver::VersionReq, minimum: &semver::Version) -> bool {
+    use semver::{Op, Prerelease, Version};
+    requirement.comparators.iter().any(|comparator| {
+        let mut lower = Version::new(
+            comparator.major,
+            comparator.minor.unwrap_or(0),
+            comparator.patch.unwrap_or(0),
+        );
+        lower.pre = comparator.pre.clone();
+        match comparator.op {
+            Op::Exact | Op::GreaterEq | Op::Caret | Op::Tilde | Op::Wildcard => lower >= *minimum,
+            Op::Greater if lower >= *minimum => true,
+            Op::Greater if comparator.pre.is_empty() => {
+                let component = if comparator.patch.is_some() {
+                    &mut lower.patch
+                } else if comparator.minor.is_some() {
+                    &mut lower.minor
+                } else {
+                    &mut lower.major
+                };
+                let Some(next) = component.checked_add(1) else {
+                    return false;
+                };
+                *component = next;
+                if requirement.comparators.iter().any(|other| {
+                    !other.pre.is_empty()
+                        && other.major == lower.major
+                        && other.minor == Some(lower.minor)
+                        && other.patch == Some(lower.patch)
+                }) {
+                    lower.pre = Prerelease::new("0").expect("valid prerelease");
+                }
+                lower >= *minimum
+            }
+            _ => false,
+        }
+    })
 }
 
 /// The manifest exactly as the package declares it, before `read_package`
@@ -901,6 +956,72 @@ default = "false"
     }
 
     #[test]
+    fn package_display_name_is_independent_of_command_names() {
+        let manifest = PACKAGED
+            .replace(
+                "[package]",
+                "[package]\ndisplay_name = \"Certificate tools\"",
+            )
+            .replace(">=0.26.0", ">=0.27.1");
+        let (commands, package) = read_manifest(&manifest).unwrap();
+        assert_eq!(
+            package.unwrap().display_name.as_deref(),
+            Some("Certificate tools")
+        );
+        assert_eq!(commands[0].name, "Popeye scan");
+        for invalid in ["\"\"", "\"   \"", "false", "42"] {
+            let manifest =
+                PACKAGED.replace("[package]", &format!("[package]\ndisplay_name = {invalid}"));
+            assert!(read_manifest(&manifest).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn package_titles_require_compatible_sofka_ranges() {
+        let named = PACKAGED.replace(
+            "[package]",
+            "[package]\ndisplay_name = \"Certificate tools\"",
+        );
+        for range in [
+            ">=0.27.1",
+            "=0.27.1",
+            "^0.27.1",
+            "~0.27.1",
+            ">0.27.0",
+            ">0.27",
+            ">=0.28",
+            "1.*",
+            ">=1",
+            ">=0.27.1, <1",
+            ">=0.27.1-alpha, >=0.27.1",
+        ] {
+            read_manifest(&named.replace(">=0.26.0", range))
+                .unwrap_or_else(|error| panic!("{range}: {error}"));
+        }
+        for range in [
+            "*",
+            ">=0.27.0",
+            "=0.26.0",
+            "^0.27",
+            "0.27.*",
+            "~0.27.0",
+            "<1",
+            "<=0.27.1",
+            ">0.26",
+            ">=0.27.1-alpha",
+            ">0.27.0, <0.27.1-beta",
+            "latest",
+        ] {
+            assert!(
+                read_manifest(&named.replace(">=0.26.0", range)).is_err(),
+                "accepted {range}"
+            );
+        }
+        assert!(read_manifest(&named.replace("sofka = \">=0.26.0\"\n", "")).is_err());
+        read_manifest(&PACKAGED.replace("sofka = \">=0.26.0\"\n", "")).unwrap();
+    }
+
+    #[test]
     fn a_package_table_is_read_beside_the_execution_fields() {
         let (commands, package) = read_manifest(PACKAGED).unwrap();
         let plugin = &commands[0];
@@ -909,6 +1030,7 @@ default = "false"
         assert_eq!(plugin.palette.as_deref(), Some("popeye"));
         assert_eq!(plugin.command, "./adapter");
         let package = package.unwrap();
+        assert!(package.display_name.is_none());
         assert_eq!(package.version, "0.1.0");
         assert_eq!(package.authors, ["sofka maintainers"]);
         assert_eq!(package.license, "MIT OR Apache-2.0");
