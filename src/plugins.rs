@@ -160,6 +160,7 @@ struct Manifest {
 #[serde(deny_unknown_fields)]
 pub struct Package {
     pub version: String,
+    pub display_name: Option<String>,
     pub description: String,
     pub license: String,
     #[serde(default)]
@@ -189,6 +190,13 @@ pub struct PackageRequirement {
 }
 
 pub fn validate_package(package: &Package) -> Result<(), String> {
+    if package
+        .display_name
+        .as_ref()
+        .is_some_and(|name| name.trim().is_empty())
+    {
+        return Err("package display_name must not be empty".into());
+    }
     if semver::Version::parse(&package.version).is_err() {
         return Err(format!(
             "package version {:?} is not a semantic version",
@@ -901,6 +909,25 @@ default = "false"
     }
 
     #[test]
+    fn package_display_name_is_independent_of_command_names() {
+        let manifest = PACKAGED.replace(
+            "[package]",
+            "[package]\ndisplay_name = \"Certificate tools\"",
+        );
+        let (commands, package) = read_manifest(&manifest).unwrap();
+        assert_eq!(
+            package.unwrap().display_name.as_deref(),
+            Some("Certificate tools")
+        );
+        assert_eq!(commands[0].name, "Popeye scan");
+        for invalid in ["\"\"", "\"   \"", "false", "42"] {
+            let manifest =
+                PACKAGED.replace("[package]", &format!("[package]\ndisplay_name = {invalid}"));
+            assert!(read_manifest(&manifest).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
     fn a_package_table_is_read_beside_the_execution_fields() {
         let (commands, package) = read_manifest(PACKAGED).unwrap();
         let plugin = &commands[0];
@@ -909,6 +936,7 @@ default = "false"
         assert_eq!(plugin.palette.as_deref(), Some("popeye"));
         assert_eq!(plugin.command, "./adapter");
         let package = package.unwrap();
+        assert!(package.display_name.is_none());
         assert_eq!(package.version, "0.1.0");
         assert_eq!(package.authors, ["sofka maintainers"]);
         assert_eq!(package.license, "MIT OR Apache-2.0");

@@ -178,6 +178,7 @@ tags = ["diagnostics", "report"]
 | Field          | Function                                                                                       |
 | -------------- | ---------------------------------------------------------------------------------------------- |
 | `version`      | Required semantic version of this package release. Separate from `schema_version`.             |
+| `display_name` | Optional package title for the catalog. Requires Sofka 0.27.1 or later.                        |
 | `description`  | Required one-line summary, shown by `sofka plugin search`.                                     |
 | `license`      | Required SPDX expression.                                                                      |
 | `authors`      | Who is responsible for the package.                                                            |
@@ -192,6 +193,12 @@ The package ID is its directory name. Each `[[commands]]` entry defines one
 command. `name` is its display name. `palette` is its full command name, without
 an automatic package prefix. Use names such as `cert-manager-status` and
 `cert-manager-renew` to group related commands.
+
+Use `[package].display_name` for a package title that stays the same when commands
+are added or reordered. The official catalog requires this title for packages
+with several commands. A package with one command can use that command's name
+as its title. If the manifest declares `display_name`, set `[package].sofka` to
+`>=0.27.1` or a later supported version. Older manifest readers reject this field.
 
 A catalog install checks the package version and Sofka requirement against the
 selected release. It also checks each command's name, palette, key, arguments,
