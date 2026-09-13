@@ -93,9 +93,9 @@ Then enter `:reload`.
 ## Manifest
 
 ```toml
-schema_version = 1
+schema_version = 2
 
-[plugin]
+[[commands]]
 name = "Resource summary"
 palette = "resource-summary"
 command = "python3"
@@ -106,10 +106,53 @@ output = "report"
 mutating = false
 timeout = "10s"
 
-[plugin.inputs.detail]
+[commands.inputs.detail]
 type = "boolean"
 default = "false"
 ```
+
+Set the root `schema_version` to `2`. A package must contain at least one
+`[[commands]]` entry. Each entry has its own inputs, resource scopes, runtime
+requirements, timeout, and safety flags. Command names, palette names, and
+nonempty key chords must be unique within the package. If one entry is invalid,
+Sofka rejects the whole package.
+
+For example, one package can contain a read-only status command and a renewal
+command that changes resources and requires confirmation:
+
+```toml
+schema_version = 2
+
+[[commands]]
+name = "Certificate status"
+palette = "cert-manager-status"
+command = "./adapter"
+args = ["status"]
+scopes = ["certificates"]
+output = "report"
+mutating = false
+
+[[commands]]
+name = "Renew certificate"
+palette = "cert-manager-renew"
+command = "./adapter"
+args = ["renew"]
+scopes = ["certificates"]
+output = "report"
+mutating = true
+confirm = true
+```
+
+The adapter must accept the action argument. The request and report protocols
+still use schema version `1`. Status remains available in read-only mode.
+Guardrails can match `plugin:cert-manager-renew` separately. Installation,
+update, and removal apply to the whole package.
+
+Sofka still reads schema `1` packages with one `[plugin]` table. To migrate,
+change the root schema version to `2`, replace `[plugin]` with `[[commands]]`,
+and replace `[plugin.inputs.NAME]` with `[commands.inputs.NAME]`. Keep each input
+table below its command entry. Do not mix the two manifest formats. Inline
+`[[plugins]]` configuration keeps its existing format.
 
 ### `[package]`
 
@@ -127,7 +170,7 @@ license = "MIT OR Apache-2.0"
 description = "Scan the active context with Popeye and report findings by linter."
 repository = "https://github.com/nklmilojevic/sofka-plugins"
 readme = "README.md"
-sofka = ">=0.26.0"
+sofka = ">=0.27.0"
 platforms = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 tags = ["diagnostics", "report"]
 ```
@@ -145,37 +188,37 @@ tags = ["diagnostics", "report"]
 | `tags`         | Search keywords.                                                                               |
 | `requirements` | Tools the adapter finds itself. `alternatives` names equivalent executables.                   |
 
-The package ID is its directory name. `[plugin]` keeps its meaning: `name` is
-the display name and `palette` is the command.
+The package ID is its directory name. Each `[[commands]]` entry defines one
+command. `name` is its display name. `palette` is its full command name, without
+an automatic package prefix. Use names such as `cert-manager-status` and
+`cert-manager-renew` to group related commands.
 
-A catalog install reconciles this manifest against the index entry it came
-from. The `[package]` version and the `[plugin]` command, target, output,
-`mutating`, `confirm`, `dangerous`, and `network_load` must match the published
-entry, and an omitted field is compared as the behaviour it produces — an
-absent `mutating` means `true`. A package that disagrees is refused.
+A catalog install checks the package version and Sofka requirement against the
+selected release. It also checks each command's name, palette, key, arguments,
+scopes, executable, target, output, and safety flags. A missing `mutating` flag
+means `true`. Sofka refuses a package if these values differ from the catalog.
 
-### `[plugin]`
+### `[[commands]]`
 
-| Field            | Function                                                                                   |
-| ---------------- | ------------------------------------------------------------------------------------------ |
-| `schema_version` | Required package format version. Use `1`.                                                  |
-| `name`           | Required display name.                                                                     |
-| `palette`        | Optional command name, without `:`. Use lowercase letters, digits, or hyphens.             |
-| `key`            | Optional key chord. Supply `key`, `palette`, or both.                                      |
-| `command`        | Required executable name or path.                                                          |
-| `args`           | Command arguments. Each item is one argument.                                              |
-| `requires`       | Executables that must be available. sofka also checks `command`.                           |
-| `install`        | Instructions that appear when an executable is absent.                                     |
-| `scopes`         | Resource plurals where the plugin can run. An empty list permits all resource kinds.       |
-| `target`         | `selection` by default. Use `context` to run once without a selected object.               |
-| `output`         | Required package output mode: `popup`, `background`, or `report`.                          |
-| `timeout`        | Maximum time for each target. Default: `30s`.                                              |
-| `mutating`       | `true` by default. Use `false` only when the plugin does not change cluster resources.     |
-| `network_load`   | Set to `true` when the plugin generates test traffic. Default: `false`.                    |
-| `confirm`        | Require confirmation before execution. Default: `false`.                                   |
-| `dangerous`      | Require confirmation and identify the action as dangerous. Default: `false`.               |
-| `port_forward`   | Optional remote port for the selected pod or service. See [Port-forwards](#port-forwards). |
-| `inputs`         | Input definitions. See [Inputs](#inputs).                                                  |
+| Field          | Function                                                                                   |
+| -------------- | ------------------------------------------------------------------------------------------ |
+| `name`         | Required display name.                                                                     |
+| `palette`      | Optional command name, without `:`. Use lowercase letters, digits, or hyphens.             |
+| `key`          | Optional key chord. Supply `key`, `palette`, or both.                                      |
+| `command`      | Required executable name or path.                                                          |
+| `args`         | Command arguments. Each item is one argument.                                              |
+| `requires`     | Executables that must be available. sofka also checks `command`.                           |
+| `install`      | Instructions that appear when an executable is absent.                                     |
+| `scopes`       | Resource plurals where the plugin can run. An empty list permits all resource kinds.       |
+| `target`       | `selection` by default. Use `context` to run once without a selected object.               |
+| `output`       | Required package output mode: `popup`, `background`, or `report`.                          |
+| `timeout`      | Maximum time for each target. Default: `30s`.                                              |
+| `mutating`     | `true` by default. Use `false` only when the plugin does not change cluster resources.     |
+| `network_load` | Set to `true` when the plugin generates test traffic. Default: `false`.                    |
+| `confirm`      | Require confirmation before execution. Default: `false`.                                   |
+| `dangerous`    | Require confirmation and identify the action as dangerous. Default: `false`.               |
+| `port_forward` | Optional remote port for the selected pod or service. See [Port-forwards](#port-forwards). |
+| `inputs`       | Input definitions. See [Inputs](#inputs).                                                  |
 
 The adapter's working directory is the package directory.
 Use `command = "./adapter"` for an executable in that directory.
@@ -202,19 +245,19 @@ Input values cannot contain spaces in this version.
 ```
 
 ```toml
-[plugin.inputs.duration]
+[commands.inputs.duration]
 type = "duration"
 default = "10s"
 min = 1
 max = 300
 
-[plugin.inputs.connections]
+[commands.inputs.connections]
 type = "integer"
 default = "20"
 min = 1
 max = 1000
 
-[plugin.inputs.port]
+[commands.inputs.port]
 type = "integer"
 min = 1
 max = 65535
@@ -392,7 +435,7 @@ The remote port must be explicit.
 sofka does not select the HTTP port or test the application protocol.
 
 ```toml
-[plugin]
+[[commands]]
 name = "Endpoint benchmark"
 palette = "benchmark"
 command = "python3"
@@ -404,7 +447,7 @@ network_load = true
 port_forward = "${input.port}"
 timeout = "2m"
 
-[plugin.inputs.port]
+[commands.inputs.port]
 type = "integer"
 min = 1
 max = 65535

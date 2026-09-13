@@ -112,14 +112,9 @@ struct Description<'a> {
     sofka: &'a str,
     platforms: Vec<&'a str>,
     requirements: &'a [crate::plugin_catalog::RuntimeRequirement],
-    command: &'a str,
-    target: &'a str,
-    output: &'a str,
-    mutating: bool,
-    confirm: bool,
+    #[serde(flatten)]
+    execution: &'a crate::plugin_catalog::CatalogExecution,
     confirmation: bool,
-    dangerous: bool,
-    network_load: bool,
     installed: bool,
     installed_version: Option<&'a str>,
     installed_withdrawal_reason: Option<&'a str>,
@@ -129,7 +124,11 @@ struct Description<'a> {
 /// `App::run_plugin`: confirmation, danger, and traffic generation each
 /// require it.
 fn confirms(release: &CatalogVersion) -> bool {
-    release.confirm || release.dangerous || release.network_load
+    release
+        .execution
+        .entries()
+        .iter()
+        .any(|command| command.confirm || command.dangerous || command.network_load)
 }
 
 pub async fn run(args: &PluginArgs) -> Result<(), String> {
@@ -291,14 +290,8 @@ fn description<'a>(
             .map(|artifact| artifact.platform.as_str())
             .collect(),
         requirements: &release.requirements,
-        command: &release.command,
-        target: &release.target,
-        output: &release.output,
-        mutating: release.mutating,
-        confirm: release.confirm,
+        execution: &release.execution,
         confirmation: confirms(release),
-        dangerous: release.dangerous,
-        network_load: release.network_load,
         installed: installed.is_some(),
         installed_version: installed,
         installed_withdrawal_reason,
@@ -335,12 +328,22 @@ async fn describe(request: &str, offline: bool, json: bool) -> Result<(), String
         println!("license: {}", description.license);
         println!("requires sofka: {}", description.sofka);
         println!("platforms: {}", description.platforms.join(", "));
-        println!("command: {}", description.command);
-        println!("target: {}", description.target);
-        println!("output: {}", description.output);
-        println!("mutating: {}", description.mutating);
-        println!("confirmation: {}", description.confirmation);
-        println!("network load: {}", description.network_load);
+        match description.execution {
+            crate::plugin_catalog::CatalogExecution::Legacy(execution) => {
+                print_execution(execution)
+            }
+            crate::plugin_catalog::CatalogExecution::Commands { commands } => {
+                for command in commands {
+                    println!(
+                        "{} ({}):",
+                        command.name,
+                        command.palette.as_deref().unwrap_or("key only")
+                    );
+                    println!("scopes: {}", command.scopes.join(", "));
+                    print_execution(&command.execution);
+                }
+            }
+        }
         println!(
             "installed: {}",
             description.installed_version.unwrap_or("no")
@@ -354,6 +357,18 @@ async fn describe(request: &str, offline: bool, json: bool) -> Result<(), String
         }
     }
     Ok(())
+}
+
+fn print_execution(command: &crate::plugin_catalog::Execution) {
+    println!("command: {}", command.command);
+    println!("target: {}", command.target);
+    println!("output: {}", command.output);
+    println!("mutating: {}", command.mutating);
+    println!(
+        "confirmation: {}",
+        command.confirm || command.dangerous || command.network_load
+    );
+    println!("network load: {}", command.network_load);
 }
 
 async fn install(requests: &[String], offline: bool) -> Result<(), String> {
@@ -853,6 +868,43 @@ mod tests {
     }
 
     #[test]
+    fn description_lists_each_command_with_its_own_safety_flags() {
+        let catalog = catalog(serde_json::json!([{
+            "version": "1.0.0", "sofka": ">=0.0.1", "source_commit": "0".repeat(40),
+            "license": "MIT", "readme": "https://example.invalid/readme", "requirements": [],
+            "command": "adapter", "target": "selection", "output": "report", "mutating": false,
+            "status": "active", "artifacts": [{"platform": "any", "url": format!("{}x/x.tar.zst", crate::plugin_catalog::RELEASE_ROOT), "blake3": "0".repeat(64), "size": 1}]
+        }]));
+        let plugin = &catalog.plugins[0];
+        let mut release = plugin.versions[0].clone();
+        let command = |name: &str, mutating: bool| crate::plugin_catalog::CatalogCommand {
+            name: name.into(),
+            palette: Some(format!("cert-manager-{name}")),
+            key: None,
+            args: vec![name.into()],
+            scopes: vec!["certificates".into()],
+            execution: crate::plugin_catalog::Execution {
+                command: "./adapter".into(),
+                target: "selection".into(),
+                output: "report".into(),
+                mutating,
+                confirm: mutating,
+                dangerous: false,
+                network_load: false,
+            },
+        };
+        release.execution = crate::plugin_catalog::CatalogExecution::Commands {
+            commands: vec![command("status", false), command("renew", true)],
+        };
+        let described = serde_json::to_value(description(plugin, &release, None)).unwrap();
+        assert_eq!(described["commands"][0]["mutating"], false);
+        assert_eq!(described["commands"][1]["mutating"], true);
+        assert_eq!(described["commands"][1]["confirm"], true);
+        assert_eq!(described["confirmation"], true);
+        assert!(described.get("mutating").is_none());
+    }
+
+    #[test]
     fn describe_selects_exact_versions_and_errors_on_anything_unknown() {
         let snapshot = snapshot(serde_json::json!([
             release("1.0.0", "active", None),
@@ -948,8 +1000,8 @@ mod tests {
         assert_eq!(described.installed_withdrawal_reason, None);
         assert_eq!(described.platforms, ["any"]);
         assert_eq!(described.sofka, ">=0.0.1");
-        assert_eq!(described.target, "selection");
-        assert_eq!(described.output, "report");
+        assert_eq!(described.execution.entries()[0].target, "selection");
+        assert_eq!(described.execution.entries()[0].output, "report");
 
         let value = serde_json::to_value(&described).unwrap();
         assert_eq!(

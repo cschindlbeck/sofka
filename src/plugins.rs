@@ -149,7 +149,8 @@ struct Manifest {
     /// index entry from it.
     #[serde(default)]
     package: Option<Package>,
-    plugin: Plugin,
+    plugin: Option<Plugin>,
+    commands: Option<Vec<Plugin>>,
 }
 
 /// The `[package]` table: who publishes this package, under what licence, and
@@ -263,7 +264,7 @@ pub fn validate_package(package: &Package) -> Result<(), String> {
 /// resolves a relative command against the package directory. Checking a
 /// package against the catalog entry it was selected from has to compare what
 /// the author wrote, not the absolute path this process resolved it to.
-pub fn read_package_manifest(dir: &Path) -> Result<(Plugin, Option<Package>), String> {
+pub fn read_package_manifest(dir: &Path) -> Result<(Vec<Plugin>, Option<Package>), String> {
     let path = dir.join("plugin.toml");
     use std::io::Read;
     let mut bytes = Vec::new();
@@ -278,48 +279,64 @@ pub fn read_package_manifest(dir: &Path) -> Result<(Plugin, Option<Package>), St
     read_manifest(std::str::from_utf8(&bytes).map_err(|e| e.to_string())?)
 }
 
-pub fn read_package(dir: &Path) -> Result<Plugin, String> {
+pub fn read_package(dir: &Path) -> Result<Vec<Plugin>, String> {
     let dir = dir.canonicalize().map_err(|e| e.to_string())?;
-    let mut plugin = read_package_manifest(&dir)?.0;
-    if plugin.command.starts_with("./") {
-        let command = dir
-            .join(&plugin.command)
-            .canonicalize()
-            .map_err(|e| e.to_string())?;
-        if !command.starts_with(&dir) {
-            return Err("relative command escapes package directory".into());
+    let mut commands = read_package_manifest(&dir)?.0;
+    for plugin in &mut commands {
+        if plugin.command.starts_with("./") {
+            let command = dir
+                .join(&plugin.command)
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            if !command.starts_with(&dir) {
+                return Err("relative command escapes package directory".into());
+            }
+            plugin.command = command.to_string_lossy().into_owned();
         }
-        plugin.command = command.to_string_lossy().into_owned();
-    }
-    for requirement in &mut plugin.requires {
-        if requirement.starts_with("./") {
-            *requirement = dir.join(&*requirement).to_string_lossy().into_owned();
+        for requirement in &mut plugin.requires {
+            if requirement.starts_with("./") {
+                *requirement = dir.join(&*requirement).to_string_lossy().into_owned();
+            }
         }
+        if !plugin.requires.contains(&plugin.command) {
+            plugin.requires.push(plugin.command.clone());
+        }
+        plugin.package_dir = Some(dir.clone());
     }
-    if !plugin.requires.contains(&plugin.command) {
-        plugin.requires.push(plugin.command.clone());
-    }
-    plugin.package_dir = Some(dir);
-    Ok(plugin)
+    Ok(commands)
 }
 
 /// Parse and validate a `plugin.toml`, wherever it came from.
-pub fn parse_manifest(text: &str) -> Result<Plugin, String> {
+pub fn parse_manifest(text: &str) -> Result<Vec<Plugin>, String> {
     Ok(read_manifest(text)?.0)
 }
 
 /// The whole manifest: how the plugin runs, and the publication metadata when
 /// the package declares any.
-pub fn read_manifest(text: &str) -> Result<(Plugin, Option<Package>), String> {
+pub fn read_manifest(text: &str) -> Result<(Vec<Plugin>, Option<Package>), String> {
     let manifest: Manifest = toml::from_str(text).map_err(|e| e.to_string())?;
-    if manifest.schema_version != 1 {
-        return Err("unsupported schema_version (expected 1)".into());
-    }
+    let commands = match (manifest.schema_version, manifest.plugin, manifest.commands) {
+        (1, Some(plugin), None) => vec![plugin],
+        (2, None, Some(commands)) if !commands.is_empty() => commands,
+        (1 | 2, _, _) => return Err("schema 1 requires [plugin]; schema 2 requires nonempty [[commands]]; do not mix the formats".into()),
+        _ => return Err("unsupported schema_version (expected 1 or 2)".into()),
+    };
     if let Some(package) = &manifest.package {
         validate_package(package)?;
     }
-    validate_plugin(&manifest.plugin)?;
-    Ok((manifest.plugin, manifest.package))
+    for (index, command) in commands.iter().enumerate() {
+        validate_plugin(command)?;
+        if commands[..index]
+            .iter()
+            .any(|other| command_conflicts(command, other))
+        {
+            return Err(format!(
+                "duplicate command name, palette, or key: {}",
+                command.name
+            ));
+        }
+    }
+    Ok((commands, manifest.package))
 }
 
 /// The manifest of every package sofka ships. Kept as real files under
@@ -333,17 +350,30 @@ pub fn bundled() -> Vec<Result<Plugin, String>> {
     let exe = std::env::current_exe();
     BUNDLED
         .iter()
-        .map(|(name, text)| {
-            let mut plugin = parse_manifest(text).map_err(|e| format!("bundled {name}: {e}"))?;
-            let exe = exe
-                .as_ref()
-                .map_err(|e| format!("bundled {name}: locating the sofka binary: {e}"))?;
-            plugin.command = exe.to_string_lossy().into_owned();
-            plugin.requires = vec![plugin.command.clone()];
-            plugin.bundled = true;
-            Ok(plugin)
+        .flat_map(|(name, text)| {
+            let commands = parse_manifest(text).and_then(|mut commands| {
+                let exe = exe
+                    .as_ref()
+                    .map_err(|e| format!("locating the sofka binary: {e}"))?;
+                for command in &mut commands {
+                    command.command = exe.to_string_lossy().into_owned();
+                    command.requires = vec![command.command.clone()];
+                    command.bundled = true;
+                }
+                Ok(commands)
+            });
+            match commands {
+                Ok(commands) => commands.into_iter().map(Ok).collect(),
+                Err(error) => vec![Err(format!("bundled {name}: {error}"))],
+            }
         })
         .collect()
+}
+
+pub(crate) fn command_conflicts(left: &Plugin, right: &Plugin) -> bool {
+    left.name == right.name
+        || (left.palette.is_some() && left.palette == right.palette)
+        || (!left.key.is_empty() && left.key == right.key)
 }
 
 pub fn validate_plugin(plugin: &Plugin) -> Result<(), String> {
@@ -455,19 +485,19 @@ pub fn load_packages(dir: &Path, plugins: &mut Vec<Plugin>, warnings: &mut Vec<S
     paths.sort();
     for path in paths {
         match read_package(&path) {
-            Ok(p) => {
-                if plugins.iter().any(|old| {
-                    old.name == p.name || (p.palette.is_some() && old.palette == p.palette)
-                }) {
-                    warnings.push(format!(
-                        "{}: duplicate plugin name/command; earlier configuration wins",
-                        path.display()
-                    ));
-                } else {
-                    if let Err(e) = available(&p) {
-                        warnings.push(format!("plugin {}: {e}", p.name));
+            Ok(commands) => {
+                for p in commands {
+                    if plugins.iter().any(|old| command_conflicts(old, &p)) {
+                        warnings.push(format!(
+                            "{}: duplicate plugin name/command; earlier configuration wins",
+                            path.display()
+                        ));
+                    } else {
+                        if let Err(e) = available(&p) {
+                            warnings.push(format!("plugin {}: {e}", p.name));
+                        }
+                        plugins.push(p);
                     }
-                    plugins.push(p);
                 }
             }
             Err(e) => warnings.push(format!("ignoring {}: {e}", path.display())),
@@ -795,7 +825,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("plugin.toml"), text).unwrap();
-        let result = read_package(&dir);
+        let result = read_package(&dir).map(|mut commands| commands.remove(0));
         std::fs::remove_dir_all(dir).unwrap();
         result
     }
@@ -825,8 +855,55 @@ mod tests {
     );
 
     #[test]
+    fn command_manifests_validate_all_entries_and_reject_ambiguous_formats() {
+        let first = PACKAGED
+            .replace("schema_version = 1", "schema_version = 2")
+            .replace("[plugin]", "[[commands]]");
+        let second = r#"
+[[commands]]
+name = "Renew"
+palette = "cert-manager-renew"
+key = "ctrl-r"
+command = "/bin/echo"
+args = ["renew"]
+scopes = ["certificates"]
+output = "report"
+mutating = true
+confirm = true
+[commands.inputs.force]
+type = "boolean"
+default = "false"
+"#;
+        let text = format!("{first}{second}");
+        let (commands, _) = read_manifest(&text).unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].mutating, Some(false));
+        assert_eq!(commands[1].mutating, Some(true));
+        assert!(commands[1].confirm);
+        assert!(commands[0].inputs.is_empty());
+        assert!(commands[1].inputs.contains_key("force"));
+        for invalid in [
+            text.replace("cert-manager-renew", "popeye"),
+            text.replace("name = \"Renew\"", "name = \"Popeye scan\""),
+            text.replace("output = \"report\"", "output = \"terminal\""),
+            text.replace("schema_version = 2", "schema_version = 1"),
+            format!("{first}\n[plugin]\nname = \"Legacy\"\ncommand = \"echo\""),
+            "schema_version = 2\ncommands = []".into(),
+            "schema_version = 2".into(),
+        ] {
+            assert!(read_manifest(&invalid).is_err(), "accepted {invalid}");
+        }
+        let duplicated_key = text.replace(
+            "palette = \"popeye\"",
+            "palette = \"popeye\"\nkey = \"ctrl-r\"",
+        );
+        assert!(read_manifest(&duplicated_key).is_err());
+    }
+
+    #[test]
     fn a_package_table_is_read_beside_the_execution_fields() {
-        let (plugin, package) = read_manifest(PACKAGED).unwrap();
+        let (commands, package) = read_manifest(PACKAGED).unwrap();
+        let plugin = &commands[0];
         // The execution half is untouched by the new table.
         assert_eq!(plugin.name, "Popeye scan");
         assert_eq!(plugin.palette.as_deref(), Some("popeye"));
@@ -848,7 +925,7 @@ mod tests {
             "schema_version = 1\n[plugin]\nname = \"Local\"\npalette = \"local\"\ncommand = \"/bin/echo\"\noutput = \"popup\"\n",
         )
         .unwrap();
-        assert_eq!(plugin.name, "Local");
+        assert_eq!(plugin[0].name, "Local");
         assert!(package.is_none());
     }
 
@@ -942,7 +1019,7 @@ mod tests {
         let valid = "schema_version = 1\n[plugin]\nname = 'Demo'\npalette = 'demo'\ncommand = '/bin/cat'\noutput = 'report'\n";
         assert!(package(valid).is_ok());
         assert!(
-            package(&valid.replace("schema_version = 1", "schema_version = 2"))
+            package(&valid.replace("schema_version = 1", "schema_version = 3"))
                 .unwrap_err()
                 .contains("unsupported")
         );

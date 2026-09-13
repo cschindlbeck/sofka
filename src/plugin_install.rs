@@ -285,7 +285,7 @@ async fn prepare_below(
 
     let mut prepared = Vec::new();
     // Manifests prepared so far in this batch, by package ID.
-    let mut batch: Vec<(String, crate::config::Plugin)> = Vec::new();
+    let mut batch: Vec<(String, Vec<crate::config::Plugin>)> = Vec::new();
     for (id, release, artifact) in selections {
         let version = release.version.clone();
         let destination = plugins.join(&id);
@@ -341,10 +341,7 @@ async fn prepare_below(
         conflicts.extend(
             batch
                 .iter()
-                .filter(|(_, manifest)| {
-                    manifest.name == package.name
-                        || (package.palette.is_some() && manifest.palette == package.palette)
-                })
+                .filter(|(_, manifest)| packages_conflict(manifest, &package))
                 .map(|(other, _)| plugins.join(other)),
         );
         batch.push((id.clone(), package.clone()));
@@ -384,7 +381,7 @@ async fn prepare_below(
 fn reconcile(
     id: &str,
     release: &plugin_catalog::CatalogVersion,
-    declared: &crate::config::Plugin,
+    declared: &[crate::config::Plugin],
     published: Option<&crate::plugins::Package>,
 ) -> Result<(), String> {
     let published = published
@@ -401,31 +398,19 @@ fn reconcile(
         published.sofka.as_deref().unwrap_or(""),
         &release.sofka,
     );
-    compare("command", &declared.command, &release.command);
-    // Resolved the way the loader resolves them, so an omitted field is
-    // compared as the behaviour it actually produces.
-    compare(
-        "target",
-        declared.target.as_deref().unwrap_or("selection"),
-        &release.target,
-    );
-    compare(
-        "output",
-        declared.output.as_deref().unwrap_or("terminal"),
-        &release.output,
-    );
-    for (field, manifest, catalog) in [
-        (
-            "mutating",
-            declared.mutating.unwrap_or(true),
-            release.mutating,
-        ),
-        ("confirm", declared.confirm, release.confirm),
-        ("dangerous", declared.dangerous, release.dangerous),
-        ("network_load", declared.network_load, release.network_load),
-    ] {
-        if manifest != catalog {
-            differences.push(format!("{field} {manifest}, catalog says {catalog}"));
+    let actual: Vec<plugin_catalog::CatalogCommand> = declared.iter().map(Into::into).collect();
+    match &release.execution {
+        plugin_catalog::CatalogExecution::Commands { commands } => {
+            if &actual != commands {
+                differences.push(
+                    "commands differ in identity, arguments, scopes, or execution settings".into(),
+                );
+            }
+        }
+        plugin_catalog::CatalogExecution::Legacy(execution) => {
+            if actual.len() != 1 || actual[0].execution != *execution {
+                differences.push("command, target, output, mutating, confirm, dangerous, or network_load differs".into());
+            }
         }
     }
     if differences.is_empty() {
@@ -441,7 +426,11 @@ fn reconcile(
 /// The installed packages a freshly staged one would collide with. Package
 /// directories load in sorted order and the first plugin name or palette
 /// command wins, so either side of a collision can end up unreachable.
-fn conflicts(plugins: &Path, destination: &Path, package: &crate::config::Plugin) -> Vec<PathBuf> {
+fn conflicts(
+    plugins: &Path,
+    destination: &Path,
+    package: &[crate::config::Plugin],
+) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(plugins) else {
         return Vec::new();
     };
@@ -452,12 +441,17 @@ fn conflicts(plugins: &Path, destination: &Path, package: &crate::config::Plugin
         .collect();
     paths.sort();
     paths.retain(|path| {
-        crate::plugins::read_package(path).is_ok_and(|other| {
-            other.name == package.name
-                || (package.palette.is_some() && other.palette == package.palette)
-        })
+        crate::plugins::read_package(path).is_ok_and(|other| packages_conflict(&other, package))
     });
     paths
+}
+
+fn packages_conflict(left: &[crate::config::Plugin], right: &[crate::config::Plugin]) -> bool {
+    left.iter().any(|a| {
+        right
+            .iter()
+            .any(|b| crate::plugins::command_conflicts(a, b))
+    })
 }
 
 fn inspect_destination(path: &Path, id: &str) -> Result<Option<InstallationRecord>, String> {
@@ -1253,6 +1247,150 @@ mod tests {
             fetched_at: 0,
             offline: true,
         }
+    }
+
+    fn multi_manifest() -> String {
+        format!(
+            "{}{}",
+            MANIFEST
+                .replace("schema_version = 1", "schema_version = 2")
+                .replace("[plugin]", "[[commands]]"),
+            r#"
+[[commands]]
+name = "Renew"
+palette = "cert-manager-renew"
+command = "/bin/echo"
+args = ["renew"]
+scopes = ["certificates"]
+output = "report"
+mutating = true
+confirm = true
+"#
+        )
+    }
+
+    fn published_commands(cache: &Path, version: &str, manifest: &str) -> CatalogSnapshot {
+        let mut snapshot = published(cache, "cert-manager", version, manifest);
+        snapshot.catalog.schema_version = 2;
+        let (commands, _) = crate::plugins::read_manifest(manifest).unwrap();
+        snapshot.catalog.plugins[0].versions[0].execution =
+            plugin_catalog::CatalogExecution::Commands {
+                commands: commands.iter().map(Into::into).collect(),
+            };
+        snapshot.catalog =
+            plugin_catalog::Catalog::parse(&serde_json::to_vec(&snapshot.catalog).unwrap())
+                .unwrap();
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn command_package_installs_updates_and_removes_as_one_unit() {
+        let config = scratch("command-lifecycle");
+        let cache = config.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let manifest = multi_manifest();
+        let snapshot = published_commands(&cache, "1.0.0", &manifest);
+        let requests = ["cert-manager".to_string()];
+        let prepared = prepare_below(&config, &cache, &snapshot, &requests, true)
+            .await
+            .unwrap();
+        assert_eq!(prepared.len(), 1);
+        prepared.into_iter().next().unwrap().activate().unwrap();
+        let destination = config.join("plugins/cert-manager");
+        let commands = crate::plugins::read_package(&destination).unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[1].args, ["renew"]);
+        let next = manifest
+            .replace("version = \"1.0.0\"", "version = \"2.0.0\"")
+            .replace("cert-manager-renew", "cert-manager-renew-v2");
+        let snapshot = published_commands(&cache, "2.0.0", &next);
+        let prepared = prepare_below(&config, &cache, &snapshot, &requests, true)
+            .await
+            .unwrap();
+        assert_eq!(prepared[0].previous_version.as_deref(), Some("1.0.0"));
+        assert_eq!(
+            prepared.into_iter().next().unwrap().activate().unwrap(),
+            Activation::Updated
+        );
+        let commands = crate::plugins::read_package(&destination).unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(
+            commands[1].palette.as_deref(),
+            Some("cert-manager-renew-v2")
+        );
+        remove_below(&config, &requests).unwrap();
+        assert!(!destination.exists());
+        std::fs::remove_dir_all(config).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_second_command_cannot_disagree_with_catalog_safety_or_identity() {
+        let config = scratch("command-reconcile");
+        let cache = config.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let snapshot = published_commands(&cache, "1.0.0", &multi_manifest());
+        for field in [
+            "mutating", "confirm", "args", "scopes", "palette", "missing",
+        ] {
+            let mut modified = snapshot.clone();
+            let plugin_catalog::CatalogExecution::Commands { commands } =
+                &mut modified.catalog.plugins[0].versions[0].execution
+            else {
+                unreachable!()
+            };
+            match field {
+                "mutating" => commands[1].execution.mutating = false,
+                "confirm" => commands[1].execution.confirm = false,
+                "args" => commands[1].args.clear(),
+                "scopes" => commands[1].scopes.clear(),
+                "palette" => commands[1].palette = Some("different".into()),
+                _ => {
+                    commands.pop();
+                }
+            }
+            let error = prepare_below(&config, &cache, &modified, &["cert-manager".into()], true)
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                error.contains("contradicts the catalog"),
+                "{field}: {error}"
+            );
+            assert!(!config.join("plugins/cert-manager").exists());
+        }
+        std::fs::remove_dir_all(config).unwrap();
+    }
+
+    #[tokio::test]
+    async fn conflicts_include_later_commands_in_installed_and_staged_packages() {
+        let config = scratch("command-conflicts");
+        let cache = config.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let mut snapshot = published_commands(&cache, "1.0.0", &multi_manifest());
+        let other_manifest = MANIFEST
+            .replace("Resource summary", "Other")
+            .replace("resource-summary", "cert-manager-renew");
+        let other = published(&cache, "other", "1.0.0", &other_manifest);
+        snapshot.catalog.plugins.extend(other.catalog.plugins);
+        let prepared = prepare_below(
+            &config,
+            &cache,
+            &snapshot,
+            &["cert-manager".into(), "other".into()],
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared[1].conflicts, [config.join("plugins/cert-manager")]);
+        let mut prepared = prepared.into_iter();
+        prepared.next().unwrap().activate().unwrap();
+        drop(prepared);
+        let prepared = prepare_below(&config, &cache, &snapshot, &["other".into()], true)
+            .await
+            .unwrap();
+        assert_eq!(prepared[0].conflicts, [config.join("plugins/cert-manager")]);
+        drop(prepared);
+        std::fs::remove_dir_all(config).unwrap();
     }
 
     fn record_for(id: &str, version: &str) -> InstallationRecord {

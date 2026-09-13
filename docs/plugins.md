@@ -59,7 +59,7 @@ The installer verifies BLAKE3 before extraction, rejects links and unsafe
 paths, validates the existing `plugin.toml` format, and activates a complete
 staged directory. It also reconciles the staged `plugin.toml` against the
 catalog entry the package was selected from and refuses a package whose
-version, command, target, output, or safety flags disagree, so what `describe`
+version or command settings disagree, so what `describe`
 reports is what the session runs. It reports missing external tools and their installation
 instructions, but does not install them. Metadata and package downloads have
 separate budgets: a download that makes no progress for 30 seconds is dropped,
@@ -72,12 +72,20 @@ Search returns an array with `id`, `display_name`, `description`, `tags`,
 `latest_version`, `compatible`, `installed`, `installed_version`, and
 `withdrawal_reason`. Describe returns `id`, `display_name`, `description`,
 `tags`, `publisher`, `repository`, `version`, `status`, `withdrawal_reason`,
-`license`, `readme`, `sofka`, `platforms`, `requirements`, `command`, `target`,
-`output`, `mutating`, `confirm`, `confirmation`, `dangerous`, `network_load`,
+`license`, `readme`, `sofka`, `platforms`, `requirements`, `confirmation`,
 `installed`, `installed_version`, and `installed_withdrawal_reason`.
-`confirmation` is true whenever sofka will prompt: `confirm`, `dangerous`, or
-`network_load` is true. List returns an array with `id`, `version`, `path`,
-`managed`, `modified`, and `withdrawal_reason`.
+For a schema 2 package, `commands` lists each command's `name`, optional `palette`
+and `key`, `args`, `scopes`, `command`, `target`, `output`, `mutating`, `confirm`,
+`dangerous`, and `network_load`. For an old release, the execution fields remain
+at the top level. `confirmation` is true if any command has `confirm`,
+`dangerous`, or `network_load` set to true. List returns an array with `id`,
+`version`, `path`, `managed`, `modified`, and `withdrawal_reason`.
+
+A package can contain several commands. Each command has separate scopes,
+inputs, and safety settings. Installation, update, and removal apply to all
+commands in the package. Catalog schema 2 can contain both old release records
+and new releases with command arrays. Sofka still accepts catalog schema 1 and
+old installed packages. Older Sofka clients cannot read catalog schema 2.
 
 Home Manager users can continue to place immutable package sources in the same
 directory. Sofka reports those as manual packages and does not take ownership

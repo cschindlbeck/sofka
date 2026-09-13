@@ -346,6 +346,8 @@ apply without a restart.
 
 sofka reads packages from the `plugins/` directory next to the base config.
 Each package directory contains a `plugin.toml` manifest.
+Schema 2 uses `[[commands]]` entries, each with separate inputs and safety settings.
+Sofka also reads schema 1 manifests with one `[plugin]` table.
 Enter `:reload` to read package changes.
 The `:config` view shows invalid packages and absent executables.
 
