@@ -1026,7 +1026,7 @@ fn dispatch(
         app.handle_key(key)?;
         take_suspend(terminal, app, captured);
     }
-    terminal.draw(|f| ui::draw(f, app))?;
+    ui::present(terminal, app)?;
     Ok(true)
 }
 
@@ -1069,7 +1069,7 @@ async fn run(
     let mut repair = altscroll::Repair::default();
 
     let mut title = terminal_title::Title::default();
-    terminal.draw(|f| ui::draw(f, app))?;
+    ui::present(terminal, app)?;
     loop {
         if app.should_quit {
             return Ok(());
@@ -1118,7 +1118,7 @@ async fn run(
                     }
                     Some(Err(_)) | None => return Ok(()),
                     Some(Ok(Event::Resize(_, _))) => {
-                        ui::resize(terminal, app)?;
+                        ui::present(terminal, app)?;
                         dirty = false;
                     }
                     _ => dirty = true,
@@ -1140,7 +1140,7 @@ async fn run(
             _ = frame.tick(), if dirty || app.scrollbar_activity.is_some() => {
                 let expired = app.expire_scrollbars();
                 if dirty || expired {
-                    terminal.draw(|f| ui::draw(f, app))?;
+                    ui::present(terminal, app)?;
                     dirty = false;
                 }
             }

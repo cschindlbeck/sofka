@@ -88,6 +88,20 @@ fn cell_alignment(align: crate::views::Align) -> Alignment {
     }
 }
 
+/// Keep terminal output in one synchronized update per frame.
+pub fn present<W: std::io::Write>(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<W>>,
+    app: &mut App,
+) -> std::io::Result<()> {
+    use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+
+    crossterm::queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let drawn = terminal.draw(|frame| draw(frame, app)).map(|_| ());
+    // Attempt to release the screen even if the draw failed.
+    let ended = crossterm::execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    drawn.and(ended)
+}
+
 /// Refresh layout after a resize before another input event can use its dimensions.
 pub fn resize<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,

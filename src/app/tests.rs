@@ -10,6 +10,7 @@ mod label_filter;
 mod proxy;
 mod scale;
 mod server_table;
+mod synchronized_output;
 
 fn obj(v: serde_json::Value) -> DynamicObject {
     serde_json::from_value(v).unwrap()
