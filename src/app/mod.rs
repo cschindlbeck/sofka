@@ -2190,6 +2190,17 @@ pub struct App {
     /// Latest Argo CD request, independent of the table watch generation.
     argocd_request: u64,
     argocd_claim: Option<StatusClaim>,
+    /// The inspected Application's managed resources, kept for their API
+    /// groups.
+    pub argocd_resources: Vec<crate::argocd::ManagedResource>,
+    /// Managed-resource rows whose `ownerReferences` descendants are shown
+    /// inline, keyed by position in `status.resources[]` and carrying the
+    /// request that may fill them, so a superseded expansion is dropped.
+    argocd_expanded: HashMap<usize, u64>,
+    /// Latest child-expansion request, so a slow one can't land after a
+    /// collapse or a re-gather.
+    argocd_children_request: u64,
+    argocd_children_claims: Vec<StatusClaim>,
     /// Session-local per-object state-change history, fed by the table watch.
     pub timeline: crate::timeline::Timeline,
     /// Table geometry from the last frame, for mouse hit-testing. A RefCell
@@ -2484,6 +2495,10 @@ impl App {
             argocd_destination: crate::argocd::Destination::Current,
             argocd_request: 0,
             argocd_claim: None,
+            argocd_resources: Vec::new(),
+            argocd_expanded: HashMap::new(),
+            argocd_children_request: 0,
+            argocd_children_claims: Vec::new(),
             timeline: crate::timeline::Timeline::default(),
             table_hit: RefCell::new(None),
             notify_tasks: HashMap::new(),
