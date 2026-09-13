@@ -775,6 +775,7 @@ pod is rejected; browse through a pod that already mounts the claim instead.
 - **Package discovery** reads `plugins/*/plugin.toml` from the sofka configuration directory.
   Packages reload with `:reload`.
 - **Named commands** and key chords start adapters without changes to sofka's source code.
+  A package can contain several commands with separate scopes, inputs, and safety settings.
 - **Validated inputs** supply named arguments with types, defaults, choices, and limits.
 - **JSON reports** show text sections and tables in a searchable document.
 - **Shared execution** limits output and concurrency.

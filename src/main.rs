@@ -209,9 +209,11 @@ async fn run_main(args: Args) -> Result<()> {
         };
     }
     if let Some(dir) = &args.validate_plugin {
-        let plugin = sofka::plugins::read_package(dir).map_err(anyhow::Error::msg)?;
-        sofka::plugins::available(&plugin).map_err(anyhow::Error::msg)?;
-        println!("valid plugin: {}", plugin.name);
+        let commands = sofka::plugins::read_package(dir).map_err(anyhow::Error::msg)?;
+        for command in commands {
+            sofka::plugins::available(&command).map_err(anyhow::Error::msg)?;
+            println!("valid plugin: {}", command.name);
+        }
         return Ok(());
     }
     if let Some(path) = &args.validate_plugin_report {

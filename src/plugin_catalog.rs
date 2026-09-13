@@ -69,6 +69,23 @@ pub struct CatalogVersion {
     pub readme: String,
     #[serde(default)]
     pub requirements: Vec<RuntimeRequirement>,
+    #[serde(flatten)]
+    pub execution: CatalogExecution,
+    pub status: VersionStatus,
+    #[serde(default)]
+    pub withdrawal_reason: Option<String>,
+    pub artifacts: Vec<Artifact>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub enum CatalogExecution {
+    Commands { commands: Vec<CatalogCommand> },
+    Legacy(Execution),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Execution {
     pub command: String,
     #[serde(default = "default_target")]
     pub target: String,
@@ -80,10 +97,85 @@ pub struct CatalogVersion {
     pub dangerous: bool,
     #[serde(default)]
     pub network_load: bool,
-    pub status: VersionStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct CatalogCommand {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub palette: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     #[serde(default)]
-    pub withdrawal_reason: Option<String>,
-    pub artifacts: Vec<Artifact>,
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(flatten)]
+    pub execution: Execution,
+}
+
+impl From<&crate::config::Plugin> for CatalogCommand {
+    fn from(command: &crate::config::Plugin) -> Self {
+        Self {
+            name: command.name.clone(),
+            palette: command.palette.clone(),
+            key: (!command.key.is_empty()).then(|| command.key.clone()),
+            args: command.args.clone(),
+            scopes: command.scopes.clone(),
+            execution: Execution {
+                command: command.command.clone(),
+                target: command.target.clone().unwrap_or_else(default_target),
+                output: command.output.clone().unwrap_or_else(|| "terminal".into()),
+                mutating: command.mutating.unwrap_or(true),
+                confirm: command.confirm,
+                dangerous: command.dangerous,
+                network_load: command.network_load,
+            },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CatalogExecution {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(commands) = value.get("commands") {
+            if [
+                "command",
+                "target",
+                "output",
+                "mutating",
+                "confirm",
+                "dangerous",
+                "network_load",
+            ]
+            .iter()
+            .any(|field| value.get(field).is_some())
+            {
+                return Err(D::Error::custom(
+                    "catalog release mixes commands and legacy execution fields",
+                ));
+            }
+            Ok(Self::Commands {
+                commands: serde_json::from_value(commands.clone()).map_err(D::Error::custom)?,
+            })
+        } else {
+            Ok(Self::Legacy(
+                serde_json::from_value(value).map_err(D::Error::custom)?,
+            ))
+        }
+    }
+}
+
+impl CatalogExecution {
+    pub fn entries(&self) -> Vec<&Execution> {
+        match self {
+            Self::Legacy(execution) => vec![execution],
+            Self::Commands { commands } => {
+                commands.iter().map(|command| &command.execution).collect()
+            }
+        }
+    }
 }
 
 fn default_target() -> String {
@@ -148,9 +240,9 @@ impl Catalog {
         }
         let schema: Schema =
             serde_json::from_slice(bytes).map_err(|e| format!("invalid catalog JSON: {e}"))?;
-        if schema.schema_version != 1 {
+        if !matches!(schema.schema_version, 1 | 2) {
             return Err(format!(
-                "unsupported catalog schema_version {} (expected 1)",
+                "unsupported catalog schema_version {} (expected 1 or 2)",
                 schema.schema_version
             ));
         }
@@ -161,9 +253,9 @@ impl Catalog {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != 1 {
+        if !matches!(self.schema_version, 1 | 2) {
             return Err(format!(
-                "unsupported catalog schema_version {} (expected 1)",
+                "unsupported catalog schema_version {} (expected 1 or 2)",
                 self.schema_version
             ));
         }
@@ -210,10 +302,41 @@ impl Catalog {
                         plugin.id, release.version
                     ));
                 }
-                if release.command.trim().is_empty()
-                    || !matches!(release.target.as_str(), "selection" | "context")
-                    || !matches!(release.output.as_str(), "popup" | "background" | "report")
-                {
+                if let CatalogExecution::Commands { commands } = &release.execution {
+                    if self.schema_version != 2 || commands.is_empty() {
+                        return Err("command entries require catalog schema 2 and a nonempty commands array".into());
+                    }
+                    let mut names = HashSet::new();
+                    let mut palettes = HashSet::new();
+                    let mut keys = HashSet::new();
+                    for command in commands {
+                        if command.name.trim().is_empty()
+                            || !names.insert(&command.name)
+                            || (command.palette.is_none() && command.key.is_none())
+                            || command.palette.as_ref().is_some_and(|palette| {
+                                palette.is_empty()
+                                    || !palette.bytes().all(|b| {
+                                        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'
+                                    })
+                                    || crate::app::plugin_command_reserved(palette)
+                                    || !palettes.insert(palette)
+                            })
+                            || command
+                                .key
+                                .as_ref()
+                                .is_some_and(|key| key.trim().is_empty() || !keys.insert(key))
+                        {
+                            return Err(
+                                "invalid or duplicate catalog command name, palette, or key".into(),
+                            );
+                        }
+                    }
+                }
+                if release.execution.entries().iter().any(|execution| {
+                    execution.command.trim().is_empty()
+                        || !matches!(execution.target.as_str(), "selection" | "context")
+                        || !matches!(execution.output.as_str(), "popup" | "background" | "report")
+                }) {
                     return Err(format!(
                         "plugin {} version {} has invalid execution metadata",
                         plugin.id, release.version
@@ -1058,13 +1181,15 @@ mod tests {
                     license: "MIT OR Apache-2.0".into(),
                     readme: "https://example.com/readme".into(),
                     requirements: vec![],
-                    command: "./resource-summary".into(),
-                    target: "selection".into(),
-                    output: "report".into(),
-                    mutating: false,
-                    confirm: false,
-                    dangerous: false,
-                    network_load: false,
+                    execution: CatalogExecution::Legacy(Execution {
+                        command: "./resource-summary".into(),
+                        target: "selection".into(),
+                        output: "report".into(),
+                        mutating: false,
+                        confirm: false,
+                        dangerous: false,
+                        network_load: false,
+                    }),
                     status: VersionStatus::Active,
                     withdrawal_reason: None,
                     artifacts: vec![Artifact {
@@ -1078,6 +1203,70 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    #[test]
+    fn command_catalogs_reject_mixed_empty_and_duplicate_definitions() {
+        let mut value = serde_json::to_value(catalog()).unwrap();
+        value["schema_version"] = 2.into();
+        let release = value["plugins"][0]["versions"][0].as_object_mut().unwrap();
+        let mut command = serde_json::Map::new();
+        for field in [
+            "command",
+            "target",
+            "output",
+            "mutating",
+            "confirm",
+            "dangerous",
+            "network_load",
+        ] {
+            command.insert(field.into(), release.remove(field).unwrap());
+        }
+        command.insert("name".into(), "Status".into());
+        command.insert("palette".into(), "cert-manager-status".into());
+        command.insert("args".into(), serde_json::json!(["status"]));
+        command.insert("scopes".into(), serde_json::json!(["certificates"]));
+        release.insert("commands".into(), serde_json::json!([command]));
+        Catalog::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+        for case in [
+            "schema",
+            "mixed",
+            "empty",
+            "duplicate",
+            "mutation",
+            "missing_mutation",
+            "palette",
+        ] {
+            let mut invalid = value.clone();
+            let release = &mut invalid["plugins"][0]["versions"][0];
+            match case {
+                "schema" => invalid["schema_version"] = 1.into(),
+                "mixed" => release["mutating"] = false.into(),
+                "empty" => release["commands"] = serde_json::json!([]),
+                "duplicate" => {
+                    let command = release["commands"][0].clone();
+                    release["commands"].as_array_mut().unwrap().push(command);
+                }
+                "mutation" => release["commands"][0]["mutating"] = "false".into(),
+                "missing_mutation" => {
+                    release["commands"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("mutating");
+                }
+                _ => release["commands"][0]["palette"] = "xray".into(),
+            }
+            assert!(
+                Catalog::parse(&serde_json::to_vec(&invalid).unwrap()).is_err(),
+                "accepted {case}"
+            );
+        }
+        let mut mixed = value.clone();
+        mixed["plugins"][0]["versions"][0]["mutating"] = false.into();
+        assert!(
+            serde_json::from_value::<Catalog>(mixed).is_err(),
+            "cached catalogs must reject mixed forms too"
+        );
     }
 
     #[test]
@@ -1106,12 +1295,12 @@ mod tests {
         Catalog::parse(&serde_json::to_vec(&value).unwrap()).unwrap();
 
         let future = serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "future_layout": {},
         });
         let error = Catalog::parse(&serde_json::to_vec(&future).unwrap()).unwrap_err();
         assert!(
-            error.contains("unsupported catalog schema_version 2"),
+            error.contains("unsupported catalog schema_version 3"),
             "{error}"
         );
     }
@@ -1269,7 +1458,7 @@ mod tests {
     #[test]
     fn validation_rejects_every_malformed_release_field() {
         let mutate: Vec<Mutation> = vec![
-            ("schema", Box::new(|c: &mut Catalog| c.schema_version = 2)),
+            ("schema", Box::new(|c: &mut Catalog| c.schema_version = 3)),
             (
                 "display name",
                 Box::new(|c: &mut Catalog| c.plugins[0].display_name = "  ".into()),
@@ -1300,15 +1489,33 @@ mod tests {
             ),
             (
                 "command",
-                Box::new(|c: &mut Catalog| c.plugins[0].versions[0].command = " ".into()),
+                Box::new(|c: &mut Catalog| {
+                    if let CatalogExecution::Legacy(execution) =
+                        &mut c.plugins[0].versions[0].execution
+                    {
+                        execution.command = " ".into()
+                    }
+                }),
             ),
             (
                 "target",
-                Box::new(|c: &mut Catalog| c.plugins[0].versions[0].target = "cluster".into()),
+                Box::new(|c: &mut Catalog| {
+                    if let CatalogExecution::Legacy(execution) =
+                        &mut c.plugins[0].versions[0].execution
+                    {
+                        execution.target = "cluster".into()
+                    }
+                }),
             ),
             (
                 "output",
-                Box::new(|c: &mut Catalog| c.plugins[0].versions[0].output = "terminal".into()),
+                Box::new(|c: &mut Catalog| {
+                    if let CatalogExecution::Legacy(execution) =
+                        &mut c.plugins[0].versions[0].execution
+                    {
+                        execution.output = "terminal".into()
+                    }
+                }),
             ),
             (
                 "requirement",
@@ -1505,7 +1712,7 @@ mod tests {
         };
 
         let mut future = cached.clone();
-        future.schema_version = 2;
+        future.schema_version = 3;
         std::fs::write(&path, serde_json::to_vec(&future).unwrap()).unwrap();
         assert!(
             load_cached(&path)

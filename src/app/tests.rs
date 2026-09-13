@@ -18137,6 +18137,90 @@ async fn context_switch_and_quit_cancel_plugin_tasks() {
 }
 
 #[tokio::test]
+async fn package_commands_keep_scope_inputs_readonly_and_guardrails_separate() {
+    let dir = std::env::temp_dir().join(format!("sofka-command-package-ui-{}", std::process::id()));
+    let package = dir.join("plugins/example");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("plugin.toml"),
+        r#"
+schema_version = 2
+[[commands]]
+name = "Read status"
+palette = "example-status"
+command = "/bin/cat"
+scopes = ["pods"]
+output = "popup"
+mutating = false
+[commands.inputs.detail]
+type = "boolean"
+default = "false"
+[[commands]]
+name = "Renew"
+palette = "example-renew"
+command = "/bin/cat"
+scopes = ["services"]
+output = "popup"
+mutating = true
+confirm = true
+"#,
+    )
+    .unwrap();
+    let (mut app, mut rx) = app_with_pod();
+    app.config = crate::config::ConfigLoader::from_dir(Some(dir.clone()));
+    plugin_command(&mut app, "reload");
+    assert_eq!(app.plugins.iter().filter(|p| !p.bundled).count(), 2);
+    app.readonly = true;
+    plugin_command(&mut app, "example-status detail=true");
+    let Msg::PluginOutput { lines, .. } = plugin_result(&mut rx).await else {
+        panic!("missing status output")
+    };
+    assert!(lines.join("\n").contains("\"detail\":\"true\""));
+    // Finish the captured run before invoking another command.
+    app.plugin_task = None;
+    plugin_command(&mut app, "example-renew");
+    assert!(app.plugin_task.is_none());
+    assert_ne!(app.mode, Mode::Confirm);
+    app.readonly = false;
+    plugin_command(&mut app, "example-renew");
+    assert!(app.plugin_task.is_none(), "the renewal scope excludes pods");
+    assert_ne!(app.mode, Mode::Confirm);
+    let renew = app
+        .plugins
+        .iter_mut()
+        .find(|p| p.palette.as_deref() == Some("example-renew"))
+        .unwrap();
+    assert!(renew.inputs.is_empty());
+    renew.scopes = vec!["pods".into()];
+    app.readonly = true;
+    plugin_command(&mut app, "example-renew");
+    assert!(app.plugin_task.is_none());
+    assert!(app.flash.contains("read-only"), "{}", app.flash);
+    app.readonly = false;
+    plugin_command(&mut app, "example-renew");
+    assert_eq!(app.mode, Mode::Confirm);
+    app.handle_key(press(KeyCode::Char('n'))).unwrap();
+    app.guardrails = vec![crate::config::Guardrail {
+        actions: vec!["plugin:example-renew".into()],
+        deny: true,
+        ..Default::default()
+    }];
+    plugin_command(&mut app, "example-renew");
+    assert!(app.flash.contains("blocked by guardrail"));
+    assert!(app.plugin_task.is_none());
+    plugin_command(&mut app, "example-status");
+    let Msg::PluginOutput { lines, .. } = plugin_result(&mut rx).await else {
+        panic!("missing status output")
+    };
+    assert!(lines.join("\n").contains("\"detail\":\"false\""));
+    app.plugin_task = None;
+    std::fs::remove_dir_all(&package).unwrap();
+    plugin_command(&mut app, "reload");
+    assert!(!app.plugins.iter().any(|p| !p.bundled));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn plugin_package_reload_loads_valid_packages_and_isolates_invalid_ones() {
     let dir = std::env::temp_dir().join(format!("sofka-plugin-reload-{}", std::process::id()));
     let package = dir.join("plugins/example");

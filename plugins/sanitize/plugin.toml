@@ -1,6 +1,6 @@
-schema_version = 1
+schema_version = 2
 
-[plugin]
+[[commands]]
 name = "Sanitize pods"
 palette = "sanitize"
 # Rewritten to the running executable when sofka registers this package, so a
@@ -14,11 +14,11 @@ mutating = true
 dangerous = true
 timeout = "2m"
 
-[plugin.inputs.states]
+[commands.inputs.states]
 type = "string"
 default = "terminal"
 choices = ["terminal", "stuck", "all"]
 
-[plugin.inputs.dry_run]
+[commands.inputs.dry_run]
 type = "boolean"
 default = "false"

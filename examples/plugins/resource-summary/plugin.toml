@@ -1,6 +1,6 @@
-schema_version = 1
+schema_version = 2
 
-[plugin]
+[[commands]]
 name = "Resource summary"
 palette = "resource-summary"
 command = "python3"
@@ -11,6 +11,6 @@ output = "report"
 mutating = false
 timeout = "10s"
 
-[plugin.inputs.detail]
+[commands.inputs.detail]
 type = "boolean"
 default = "false"
