@@ -11,6 +11,9 @@
 //! This module is pure: it reads `DynamicObject`s and produces findings, so it
 //! is unit-tested without a cluster. The app layer gathers and renders.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
+
 use kube::core::DynamicObject;
 use serde_json::Value;
 
@@ -150,8 +153,14 @@ impl ManagedResource {
         }
     }
 
-    fn line(&self) -> String {
-        let mut s = format!("{}/{}", self.kind, self.name);
+    /// `Kind/name`, or `Kind.group/name` when another managed resource would
+    /// otherwise render the same text.
+    fn line(&self, qualified: bool) -> String {
+        let mut s = if qualified && !self.group.is_empty() {
+            format!("{}.{}/{}", self.kind, self.group, self.name)
+        } else {
+            format!("{}/{}", self.kind, self.name)
+        };
         let state = match (self.sync.as_str(), self.health.as_str()) {
             ("", "") => String::new(),
             (sync, "") => sync.to_string(),
@@ -343,6 +352,80 @@ pub fn owner_ref(obj: &DynamicObject) -> Option<OwnerRef> {
     Some(parse_instance(instance, false))
 }
 
+/// Whether `obj` names `uid` among its `ownerReferences`.
+///
+/// `status.resources[]` is flat: it holds what the Application applies, not what
+/// those objects went on to create. The parent/child edges exist only on the
+/// children themselves.
+pub fn owned_by(obj: &DynamicObject, uid: &str) -> bool {
+    !uid.is_empty()
+        && obj
+            .metadata
+            .owner_references
+            .as_ref()
+            .is_some_and(|refs| refs.iter().any(|r| r.uid == uid))
+}
+
+/// A one-word state for a descendant, or empty when the kind has nothing worth
+/// summarising on a tree line.
+pub fn descendant_state(obj: &DynamicObject) -> Cow<'_, str> {
+    // A pod stuck pulling or crash-looping reports `Running`-adjacent phases
+    // that hide the reason, so the waiting reason wins when there is one.
+    if let Some(reason) = waiting_reason(obj) {
+        return Cow::Borrowed(reason);
+    }
+    let phase = str_at(&obj.data, "/status/phase");
+    if !phase.is_empty() {
+        return Cow::Borrowed(phase);
+    }
+    if let Some(state) = job_state(obj) {
+        return Cow::Borrowed(state);
+    }
+    // Desired comes from the spec: `status.replicas` is what exists right now,
+    // so a scaling ReplicaSet would otherwise read as fully ready.
+    let desired = obj
+        .data
+        .pointer("/spec/replicas")
+        .or_else(|| obj.data.pointer("/status/replicas"))
+        .and_then(Value::as_i64);
+    let ready = obj
+        .data
+        .pointer("/status/readyReplicas")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    match desired {
+        Some(0) | None => Cow::Borrowed(""),
+        Some(n) => Cow::Owned(format!("{ready}/{n} ready")),
+    }
+}
+
+/// Whether `spec.replicas` is explicitly zero. An absent value defaults to one,
+/// and list responses omit per-item kinds, so the caller supplies the kind.
+pub fn scaled_to_zero(obj: &DynamicObject) -> bool {
+    obj.data.pointer("/spec/replicas").and_then(Value::as_i64) == Some(0)
+}
+
+/// The first container waiting reason, e.g. `CrashLoopBackOff`.
+fn waiting_reason(obj: &DynamicObject) -> Option<&str> {
+    obj.data
+        .pointer("/status/containerStatuses")
+        .and_then(Value::as_array)?
+        .iter()
+        .find_map(|c| c.pointer("/state/waiting/reason").and_then(Value::as_str))
+        .filter(|r| !r.is_empty())
+}
+
+/// `Complete` or `Failed` from a Job's conditions.
+fn job_state(obj: &DynamicObject) -> Option<&str> {
+    obj.data
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|c| c.get("status").and_then(Value::as_str) == Some("True"))
+        .and_then(|c| c.get("type").and_then(Value::as_str))
+        .filter(|t| matches!(*t, "Complete" | "Failed"))
+}
+
 /// Whether `app` lists this object in `status.resources[]`.
 ///
 /// Two Argo CD instances in one cluster can hold same-named Applications, and
@@ -530,8 +613,19 @@ pub fn describe(ev: &Evidence) -> Vec<Finding> {
     if ev.resources.is_empty() {
         out.push(finding(1, Level::Info, "none reported"));
     }
+    // Two managed resources can differ only by API group, and would otherwise
+    // be two identical-looking rows.
+    let mut seen: HashMap<(&str, &str, &str), usize> = HashMap::new();
+    for r in &ev.resources {
+        *seen
+            .entry((r.kind.as_str(), r.namespace.as_str(), r.name.as_str()))
+            .or_default() += 1;
+    }
     for r in ev.resources.iter().take(MAX_LISTED) {
-        let mut f = finding(1, r.level(), r.line());
+        let qualified = seen
+            .get(&(r.kind.as_str(), r.namespace.as_str(), r.name.as_str()))
+            .is_some_and(|n| *n > 1);
+        let mut f = finding(1, r.level(), r.line(qualified));
         if let Some(t) = r.target(&ev.destination) {
             f = f.with_target(t);
         }
@@ -694,7 +788,7 @@ fn sync_summary(
         let line = match (sync, health) {
             ("Synced", "Healthy") => format!("synced and healthy{at}"),
             ("", "") => "no status reported yet".to_string(),
-            (s, h) => format!("{s} · {h}{at}"),
+            (s, h) => format!("{s} / {h}{at}"),
         };
         let level = if sync == "Synced" && health == "Healthy" {
             Level::Good
