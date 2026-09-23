@@ -856,7 +856,7 @@ impl App {
         self.switch_context_inner(name, false);
     }
 
-    fn switch_context_inner(&mut self, name: String, reload: bool) {
+    pub(super) fn switch_context_inner(&mut self, name: String, reload: bool) {
         // Selecting the current context again does nothing unless a plugin
         // requested a reload or the initial connection failed.
         if !reload && name == self.cluster.context && self.cluster.connected {
@@ -881,6 +881,8 @@ impl App {
         self.pending_resource_query = None;
         self.pending_bookmark = None;
         self.pending_workspace = None;
+        self.pending_argocd_target = None;
+        self.pending_argocd_return = None;
         // Stop the current context's watches and clear stale rows while we
         // reconnect; the new watch starts when the connection lands. The rows
         // are stashed first — if the switch fails we stay on this context,
@@ -1017,7 +1019,11 @@ impl App {
         self.config_warnings.extend(plugin_warnings);
         self.config_warnings.extend(threshold_warnings);
         // Explicit destinations take priority over the previous resource type.
-        if let Some(mut query) = self.pending_resource_query.take() {
+        if let Some(jump) = self.pending_argocd_target.take() {
+            self.open_remote_managed_resource(jump, &name);
+        } else if let Some(back) = self.pending_argocd_return.take() {
+            self.reopen_argocd(back);
+        } else if let Some(mut query) = self.pending_resource_query.take() {
             query.context = None;
             self.apply_resource_query(query);
         } else if self.pending_workspace.is_some() {

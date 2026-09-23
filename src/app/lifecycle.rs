@@ -25,6 +25,8 @@ impl App {
             self.switch_context(context);
             self.pending_bookmark = None;
             self.pending_workspace = None;
+            self.pending_argocd_target = None;
+            self.pending_argocd_return = None;
             self.pending_resource_query = Some(query);
             return;
         }
@@ -101,6 +103,7 @@ impl App {
     /// view always starts with its first row selected.
     pub(super) fn set_root_view(&mut self, kind: Kind) {
         self.stack.clear();
+        self.argocd_return = None;
         self.kind_plural = kind.ar.plural.to_lowercase();
         self.kind = Some(kind);
         self.labels = None;
@@ -328,6 +331,8 @@ impl App {
             self.pending_resource_query = None;
             self.pending_bookmark = None;
             self.pending_workspace = None;
+            self.pending_argocd_target = None;
+            self.pending_argocd_return = None;
         }
         self.applied_filter_labels = filter_labels;
         self.applied_filter_fields = filter_fields;
@@ -1365,8 +1370,13 @@ impl App {
                     .iter()
                     .position(|f| f.target.is_some())
                     .unwrap_or(0);
+                let selected = self
+                    .argocd_reselect
+                    .take()
+                    .and_then(|row| self.managed_row_at(row))
+                    .unwrap_or(first);
                 self.argocd_state
-                    .select((!self.argocd_items.is_empty()).then_some(first));
+                    .select((!self.argocd_items.is_empty()).then_some(selected));
                 self.clear_claimed_status(claim);
                 // Nothing in the Application's own status says why it is
                 // unhealthy, so go and look. Costs nothing for the rest.
@@ -1852,6 +1862,14 @@ impl App {
                         self.pending_resource_query = None;
                         self.pending_bookmark = None;
                         self.pending_workspace = None;
+                        // A jump that never landed reopens the view it left; a
+                        // return that never landed leaves its way back on the table.
+                        if let Some(jump) = self.pending_argocd_target.take() {
+                            self.reopen_argocd(jump.back);
+                        }
+                        if let Some(back) = self.pending_argocd_return.take() {
+                            self.argocd_return = Some(back);
+                        }
                         self.flash_warn(&format!("context switch failed: {e}"));
                         // Never connected anywhere yet — put the picker back up
                         // instead of stranding the user on an empty table.

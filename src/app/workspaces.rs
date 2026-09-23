@@ -54,6 +54,8 @@ impl App {
             self.switch_context(ctx);
             self.pending_resource_query = None;
             self.pending_bookmark = None;
+            self.pending_argocd_target = None;
+            self.pending_argocd_return = None;
             self.pending_workspace = Some(ws);
             return;
         }
@@ -113,7 +115,10 @@ impl App {
             };
             let resource = DEFAULT_RESOURCES[index];
             if self.cluster.resolve(resource).is_some() {
+                // Still browsing where a remote Argo CD jump landed: keep its way back.
+                let back = self.argocd_return.take();
                 self.switch_kind(resource);
+                self.argocd_return = back;
                 return true;
             }
         }
