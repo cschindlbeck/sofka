@@ -448,7 +448,29 @@ pub fn bundled() -> Vec<Result<Plugin, String>> {
 pub(crate) fn command_conflicts(left: &Plugin, right: &Plugin) -> bool {
     left.name == right.name
         || (left.palette.is_some() && left.palette == right.palette)
-        || (!left.key.is_empty() && left.key == right.key)
+        || keys_conflict(&left.key, &left.scopes, &right.key, &right.scopes)
+}
+
+/// Whether two key bindings would fire on the same keypress in some view.
+pub(crate) fn keys_conflict(
+    left: &str,
+    left_scopes: &[String],
+    right: &str,
+    right_scopes: &[String],
+) -> bool {
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    let same = match (
+        crate::keys::KeyChord::parse(left),
+        crate::keys::KeyChord::parse(right),
+    ) {
+        (Ok(left), Ok(right)) => crate::keymap::overlaps(&left, &right),
+        _ => left == right,
+    };
+    same && (left_scopes.is_empty()
+        || right_scopes.is_empty()
+        || left_scopes.iter().any(|scope| right_scopes.contains(scope)))
 }
 
 pub fn validate_plugin(plugin: &Plugin) -> Result<(), String> {
@@ -1067,6 +1089,69 @@ default = "false"
             "palette = \"popeye\"\nkey = \"ctrl-r\"",
         );
         assert!(read_manifest(&duplicated_key).is_err());
+    }
+
+    fn scoped_manifest(first: &str, second: &str) -> String {
+        format!(
+            "schema_version = 2\n\
+             [[commands]]\nname = \"Pod x\"\ncommand = \"cat\"\noutput = \"background\"\nkey = \"x\"\n{first}\n\
+             [[commands]]\nname = \"Deployment x\"\ncommand = \"cat\"\noutput = \"background\"\n{second}\n"
+        )
+    }
+
+    #[test]
+    fn shared_keys_conflict_only_when_scopes_overlap() {
+        let disjoint = scoped_manifest(
+            "scopes = [\"pods\"]",
+            "key = \"x\"\nscopes = [\"deployments\"]",
+        );
+        assert_eq!(read_manifest(&disjoint).unwrap().0.len(), 2);
+        for invalid in [
+            scoped_manifest(
+                "scopes = [\"pods\", \"services\"]",
+                "key = \"x\"\nscopes = [\"services\"]",
+            ),
+            scoped_manifest("scopes = [\"pods\"]", "key = \"x\""),
+            scoped_manifest("", "key = \"x\"\nscopes = [\"deployments\"]"),
+            scoped_manifest("scopes = [\"pods\"]", "key = \"X\"\nscopes = [\"pods\"]")
+                .replace("key = \"x\"", "key = \"shift-x\""),
+            scoped_manifest(
+                "scopes = [\"pods\"]",
+                "key = \"control-X\"\nscopes = [\"pods\"]",
+            )
+            .replace("key = \"x\"", "key = \"ctrl-x\""),
+        ] {
+            let error = read_manifest(&invalid).unwrap_err();
+            assert!(error.contains("duplicate"), "{error}: {invalid}");
+        }
+    }
+
+    #[test]
+    fn packages_reuse_a_key_across_disjoint_scopes() {
+        let dir = std::env::temp_dir().join(format!("sofka-scoped-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (package, name, scope) in [
+            ("a-pod-x", "Pod x", "pods"),
+            ("b-deployment-x", "Deployment x", "deployments"),
+            ("c-pod-x-again", "Pod x again", "pods"),
+        ] {
+            std::fs::create_dir_all(dir.join(package)).unwrap();
+            std::fs::write(
+                dir.join(package).join("plugin.toml"),
+                format!(
+                    "schema_version = 2\n[[commands]]\nname = \"{name}\"\ncommand = \"cat\"\noutput = \"background\"\n\
+                     key = \"x\"\nscopes = [\"{scope}\"]\nmutating = false\n"
+                ),
+            )
+            .unwrap();
+        }
+        let (mut plugins, mut warnings) = (Vec::new(), Vec::new());
+        load_packages(&dir, &mut plugins, &mut warnings);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let names: Vec<_> = plugins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Pod x", "Deployment x"]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("c-pod-x-again"), "{warnings:?}");
     }
 
     #[test]
